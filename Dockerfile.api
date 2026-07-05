@@ -1,0 +1,33 @@
+FROM --platform=linux/arm64 python:3.11-slim
+
+WORKDIR /app
+
+# Dependencias del sistema mínimas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    libaio1t64 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/lib/aarch64-linux-gnu/libaio.so.1t64 /usr/lib/aarch64-linux-gnu/libaio.so.1
+
+# Oracle Instant Client (requerido por oracledb en modo thick, igual que producción)
+RUN curl -fsSL -o /tmp/instantclient.zip \
+        https://download.oracle.com/otn_software/linux/instantclient/2326200/instantclient-basiclite-linux.arm64-23.26.2.0.0.zip \
+    && unzip -q /tmp/instantclient.zip -d /opt/oracle \
+    && rm /tmp/instantclient.zip \
+    && echo /opt/oracle/instantclient_23_26 > /etc/ld.so.conf.d/oracle-instantclient.conf \
+    && ldconfig
+
+ENV LD_LIBRARY_PATH=/opt/oracle/instantclient_23_26
+
+# Dependencias Python
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Código fuente
+COPY main.py .
+COPY fase1_patrimonio.py .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
