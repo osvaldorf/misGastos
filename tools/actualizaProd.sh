@@ -27,8 +27,8 @@ if [ "$DEPLOY_FRONTEND" = true ]; then
     cd $FRONTEND_DIR && npm run build
     echo "  ✅ Build completado"
     echo "\n▶ [2] Subiendo frontend..."
-    scp -i $SSH_KEY -r $FRONTEND_DIR/dist/* $SERVER:$REMOTE_DIR/frontend/
-    echo "  ✅ Frontend subido"
+    rsync -avz --delete -e "ssh -i $SSH_KEY" $FRONTEND_DIR/dist/ $SERVER:$REMOTE_DIR/frontend/
+    echo "  ✅ Frontend subido (archivos viejos eliminados)"
 fi
 
 if [ "$DEPLOY_BACKEND" = true ]; then
