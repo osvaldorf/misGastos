@@ -1,17 +1,17 @@
 import { useEffect, useState, useCallback } from 'react'
 import { getIngresos, createIngreso, deleteIngreso } from '../api/ingresos'
 import { getCuentas, getFuentes, getFuentesPrestamo } from '../api/catalogos'
-import { card, inputStyle, labelStyle, btnPrimary, btnSecondary, btnDanger, Modal, ErrorBox, fmtMoney } from '../components/ui'
+import { card, inputStyle, labelStyle, btnPrimary, btnSecondary, btnDanger, Modal, ErrorBox, fmtMoney, currentMonthRange, today } from '../components/ui'
 
 const TIPOS = ['Salario', 'Renta', 'Inversión', 'Préstamo', 'Otro']
-const emptyForm = { descripcion: '', tipo: 'Salario', fuente_id: '', monto: '', moneda: 'MXN', fecha: new Date().toISOString().slice(0, 10), cuenta_id: '', notas: '', prestatario_id: '', capital: '', intereses: '' }
+const emptyForm = { descripcion: '', tipo: 'Salario', fuente_id: '', monto: '', moneda: 'MXN', fecha: today(), cuenta_id: '', notas: '', prestatario_id: '', capital: '', intereses: '' }
 
 export default function Ingresos() {
   const [ingresos, setIngresos] = useState([])
   const [cuentas, setCuentas] = useState([])
   const [fuentes, setFuentes] = useState([])
   const [prestatarios, setPrestatarios] = useState([])
-  const [filtros, setFiltros] = useState({ tipo: '', fuente_id: '' })
+  const [filtros, setFiltros] = useState({ tipo: '', fuente_id: '', ...currentMonthRange() })
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm] = useState(emptyForm)
   const [error, setError] = useState(null)
@@ -23,6 +23,8 @@ export default function Ingresos() {
     const params = {}
     if (filtros.tipo) params.tipo = filtros.tipo
     if (filtros.fuente_id) params.fuente_id = filtros.fuente_id
+    if (filtros.fecha_ini) params.fecha_ini = filtros.fecha_ini
+    if (filtros.fecha_fin) params.fecha_fin = filtros.fecha_fin
     getIngresos(params).then(r => setIngresos(r.data)).catch(() => {})
   }, [filtros])
 
@@ -117,6 +119,8 @@ export default function Ingresos() {
           <option value="">Todas las fuentes</option>
           {fuentes.map(f => <option key={f.id} value={f.id}>{f.nombre}</option>)}
         </select>
+        <input type="date" style={{ ...inputStyle, width: 'auto' }} value={filtros.fecha_ini} onChange={e => setFiltros(f => ({ ...f, fecha_ini: e.target.value }))} />
+        <input type="date" style={{ ...inputStyle, width: 'auto' }} value={filtros.fecha_fin} onChange={e => setFiltros(f => ({ ...f, fecha_fin: e.target.value }))} />
       </div>
 
       <div style={card}>

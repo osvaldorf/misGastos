@@ -1,9 +1,9 @@
 import { useEffect, useState, useCallback } from 'react'
 import { getGastos, getGastosResumen, createGasto, updateGasto, deleteGasto } from '../api/gastos'
 import { getCategorias, getCuentas, getDestinatarios } from '../api/catalogos'
-import { card, inputStyle, labelStyle, btnPrimary, btnSecondary, btnDanger, Modal, ErrorBox, fmtMoney } from '../components/ui'
+import { card, inputStyle, labelStyle, btnPrimary, btnSecondary, btnDanger, Modal, ErrorBox, fmtMoney, currentMonthRange, today } from '../components/ui'
 
-const emptyForm = { descripcion: '', monto: '', moneda: 'MXN', fecha: new Date().toISOString().slice(0, 10), categoria_id: '', cuenta_id: '', destinatario_id: '', notas: '' }
+const emptyForm = { descripcion: '', monto: '', moneda: 'MXN', fecha: today(), categoria_id: '', cuenta_id: '', destinatario_id: '', notas: '' }
 
 export default function Gastos() {
   const [gastos, setGastos] = useState([])
@@ -11,7 +11,7 @@ export default function Gastos() {
   const [categorias, setCategorias] = useState([])
   const [cuentas, setCuentas] = useState([])
   const [destinatarios, setDestinatarios] = useState([])
-  const [filtros, setFiltros] = useState({ categoria_id: '', dest_id: '', cuenta_id: '', fecha_ini: '', fecha_fin: '' })
+  const [filtros, setFiltros] = useState({ categoria_id: '', dest_id: '', cuenta_id: '', ...currentMonthRange() })
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [form, setForm] = useState(emptyForm)

@@ -87,3 +87,21 @@ export function fmtMoney(n, moneda = 'MXN') {
 }
 
 export const PALETTE = ['#1D9E75', '#3B82F6', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#14B8A6', '#F97316', '#6366F1', '#84CC16', '#06B6D4', '#A855F7']
+
+function fmtDate(d) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+export function currentMonthRange() {
+  const now = new Date()
+  const first = new Date(now.getFullYear(), now.getMonth(), 1)
+  const last = new Date(now.getFullYear(), now.getMonth() + 1, 0)
+  return { fecha_ini: fmtDate(first), fecha_fin: fmtDate(last) }
+}
+
+export function today() {
+  return fmtDate(new Date())
+}
