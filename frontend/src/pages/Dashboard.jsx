@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react'
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Legend } from 'recharts'
 import { getResumen, getPorCategoria, getPorFuente, getFlujoMensual } from '../api/balance'
-import { card, fmtMoney, PALETTE } from '../components/ui'
+import { card, fmtMoney, PALETTE, currentMonthRange, currentYearRange } from '../components/ui'
+
+const MES_ACTUAL_LABEL = new Date().toLocaleDateString('es-MX', { month: 'long', year: 'numeric' })
+const ANIO_ACTUAL = new Date().getFullYear()
 
 function StatCard({ label, value, color, sub }) {
   return (
@@ -35,7 +38,8 @@ function DonutCard({ title, data, nameKey, valueKey }) {
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5 }}>
                 <span style={{ width: 10, height: 10, borderRadius: 3, background: d.color || PALETTE[i % PALETTE.length], flexShrink: 0 }} />
                 <span style={{ flex: 1, color: '#374151' }}>{d.emoji ? `${d.emoji} ` : ''}{d[nameKey]}</span>
-                <span style={{ color: '#6b7280', fontWeight: 600 }}>{total ? Math.round(d[valueKey] / total * 100) : 0}%</span>
+                <span style={{ color: '#6b7280' }}>{fmtMoney(d[valueKey])}</span>
+                <span style={{ color: '#6b7280', fontWeight: 600, minWidth: 34, textAlign: 'right' }}>{total ? Math.round(d[valueKey] / total * 100) : 0}%</span>
               </div>
             ))}
           </div>
@@ -49,12 +53,18 @@ export default function Dashboard() {
   const [resumen, setResumen] = useState(null)
   const [porCategoria, setPorCategoria] = useState([])
   const [porFuente, setPorFuente] = useState([])
+  const [porCategoriaMes, setPorCategoriaMes] = useState([])
+  const [porFuenteMes, setPorFuenteMes] = useState([])
   const [flujo, setFlujo] = useState([])
 
   useEffect(() => {
+    const rangoAnio = currentYearRange()
+    const rangoMes = currentMonthRange()
     getResumen().then(r => setResumen(r.data)).catch(() => {})
-    getPorCategoria().then(r => setPorCategoria(r.data)).catch(() => {})
-    getPorFuente().then(r => setPorFuente(r.data)).catch(() => {})
+    getPorCategoria(rangoAnio).then(r => setPorCategoria(r.data)).catch(() => {})
+    getPorFuente(rangoAnio).then(r => setPorFuente(r.data)).catch(() => {})
+    getPorCategoria(rangoMes).then(r => setPorCategoriaMes(r.data)).catch(() => {})
+    getPorFuente(rangoMes).then(r => setPorFuenteMes(r.data)).catch(() => {})
     getFlujoMensual().then(r => setFlujo(r.data.slice(-6))).catch(() => {})
   }, [])
 
@@ -71,9 +81,20 @@ export default function Dashboard() {
           sub={resumen ? `${resumen.prestamos_activos} préstamos activos` : ''} />
       </div>
 
+      <div style={{ fontSize: 13, fontWeight: 600, color: '#6b7280', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.4 }}>
+        Anual · {ANIO_ACTUAL}
+      </div>
       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 20 }}>
         <DonutCard title="🍽️ Gastos por categoría" data={porCategoria} nameKey="nombre" valueKey="total_mxn" />
         <DonutCard title="💰 Ingresos por fuente" data={porFuente} nameKey="nombre" valueKey="total_mxn" />
+      </div>
+
+      <div style={{ fontSize: 13, fontWeight: 600, color: '#6b7280', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.4 }}>
+        Mes actual · {MES_ACTUAL_LABEL}
+      </div>
+      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 20 }}>
+        <DonutCard title="🍽️ Gastos por categoría" data={porCategoriaMes} nameKey="nombre" valueKey="total_mxn" />
+        <DonutCard title="💰 Ingresos por fuente" data={porFuenteMes} nameKey="nombre" valueKey="total_mxn" />
       </div>
 
       <div style={card}>

@@ -44,7 +44,10 @@ export default function Login() {
           <p style={{ fontSize: 14, color: '#6b7280', marginTop: 4 }}>Inicia sesión para continuar</p>
         </div>
 
-        <form onSubmit={handleSubmit}>
+        <form
+          onSubmit={handleSubmit}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); handleSubmit(e) } }}
+        >
           <div style={{ marginBottom: 14 }}>
             <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#374151', marginBottom: 5 }}>
               Email

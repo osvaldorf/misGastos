@@ -102,6 +102,13 @@ export function currentMonthRange() {
   return { fecha_ini: fmtDate(first), fecha_fin: fmtDate(last) }
 }
 
+export function currentYearRange() {
+  const now = new Date()
+  const first = new Date(now.getFullYear(), 0, 1)
+  const last = new Date(now.getFullYear(), 11, 31)
+  return { fecha_ini: fmtDate(first), fecha_fin: fmtDate(last) }
+}
+
 export function today() {
   return fmtDate(new Date())
 }
