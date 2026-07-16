@@ -2,9 +2,9 @@ import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getPrestamos } from '../api/balance'
 import { createPrestatario, updatePrestatario, deletePrestatario } from '../api/catalogos'
-import { card, inputStyle, labelStyle, btnPrimary, btnSecondary, btnDanger, Modal, ErrorBox, fmtMoney } from '../components/ui'
+import { card, inputStyle, labelStyle, btnPrimary, btnSecondary, btnDanger, Modal, ErrorBox, fmtMoney, calcularCuotaFija } from '../components/ui'
 
-const emptyForm = { nombre: '', capital_original: '', tasa_interes: '', fecha_prestamo: '', fecha_vencimiento: '', notas: '' }
+const emptyForm = { nombre: '', capital_original: '', tasa_interes: '', pagos_por_anio: 12, numero_pagos: '', fecha_prestamo: '', fecha_vencimiento: '', notas: '' }
 
 export default function Prestamos() {
   const navigate = useNavigate()
@@ -34,11 +34,14 @@ export default function Prestamos() {
     setEditing(p)
     setForm({
       nombre: p.nombre, capital_original: p.capital_original, tasa_interes: p.tasa_interes || '',
+      pagos_por_anio: p.pagos_por_anio || 12, numero_pagos: p.numero_pagos || '',
       fecha_prestamo: p.fecha_prestamo?.slice(0, 10) || '', fecha_vencimiento: p.fecha_vencimiento?.slice(0, 10) || '',
       notas: p.notas || ''
     })
     setError(null); setModalOpen(true)
   }
+
+  const cuotaEstimada = calcularCuotaFija(form.capital_original, form.tasa_interes, form.pagos_por_anio, form.numero_pagos)
 
   const submit = async e => {
     e.preventDefault()
@@ -47,6 +50,7 @@ export default function Prestamos() {
     const body = {
       nombre: form.nombre, capital_original: Number(form.capital_original),
       tasa_interes: Number(form.tasa_interes || 0),
+      pagos_por_anio: Number(form.pagos_por_anio || 12), numero_pagos: form.numero_pagos ? Number(form.numero_pagos) : null,
       fecha_prestamo: form.fecha_prestamo || null, fecha_vencimiento: form.fecha_vencimiento || null,
       notas: form.notas
     }
@@ -113,6 +117,7 @@ export default function Prestamos() {
                   <div style={{ fontWeight: 700, fontSize: 16 }}>{p.nombre}</div>
                   <div style={{ fontSize: 13, color: '#9ca3af', marginTop: 2 }}>
                     {p.tasa_interes ? `${p.tasa_interes}% anual · ` : ''}
+                    {p.numero_pagos ? `Pago ${Math.min(p.pagos_realizados + 1, p.numero_pagos)}/${p.numero_pagos} · ` : ''}
                     Desde {p.fecha_prestamo?.slice(0, 10)}
                     {p.fecha_vencimiento && ` · Vence ${p.fecha_vencimiento.slice(0, 10)}`}
                   </div>
@@ -181,6 +186,21 @@ export default function Prestamos() {
                 <input style={inputStyle} type="number" step="0.01" value={form.tasa_interes} onChange={e => set('tasa_interes', e.target.value)} />
               </div>
             </div>
+            <div style={{ display: 'flex', gap: 12, marginBottom: 14 }}>
+              <div style={{ flex: 1 }}>
+                <label style={labelStyle}>Pagos por año</label>
+                <input style={inputStyle} type="number" step="1" placeholder="12" value={form.pagos_por_anio} onChange={e => set('pagos_por_anio', e.target.value)} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={labelStyle}>Número de pagos (plazo total)</label>
+                <input style={inputStyle} type="number" step="1" placeholder="Ej. 5" value={form.numero_pagos} onChange={e => set('numero_pagos', e.target.value)} />
+              </div>
+            </div>
+            {cuotaEstimada != null && (
+              <div style={{ marginBottom: 14, fontSize: 13, color: '#0F6E56', background: '#E1F5EE', borderRadius: 8, padding: '8px 12px' }}>
+                💡 Cuota fija estimada por período: <strong>{fmtMoney(cuotaEstimada)}</strong>
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 12, marginBottom: 14 }}>
               <div style={{ flex: 1 }}>
                 <label style={labelStyle}>Fecha de préstamo</label>

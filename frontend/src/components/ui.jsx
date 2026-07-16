@@ -112,3 +112,12 @@ export function currentYearRange() {
 export function today() {
   return fmtDate(new Date())
 }
+
+// Amortización francesa (cuota fija) — misma fórmula que usa el backend en calcular_amortizacion()
+export function calcularCuotaFija(capitalOriginal, tasaInteresAnual, pagosPorAnio, numeroPagos) {
+  const capital = Number(capitalOriginal || 0), tasa = Number(tasaInteresAnual || 0)
+  const ppa = Number(pagosPorAnio || 0), n = Number(numeroPagos || 0)
+  if (!capital || !ppa || !n) return null
+  const i = tasa / 100 / ppa
+  return i > 0 ? capital * i / (1 - Math.pow(1 + i, -n)) : capital / n
+}
