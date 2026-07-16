@@ -48,9 +48,33 @@ export default function Ingresos() {
   const openNuevo = () => { setForm(emptyForm); setError(null); setModalOpen(true) }
   const openPagoPrestamo = p => {
     const fuentePrestamo = fuentes.find(f => f.tipo === 'Préstamo')
-    setForm({ ...emptyForm, tipo: 'Préstamo', prestatario_id: p.id, fuente_id: fuentePrestamo?.id || '', descripcion: `Pago préstamo — ${p.nombre}` })
+    setForm({
+      ...emptyForm, tipo: 'Préstamo', prestatario_id: p.id, fuente_id: fuentePrestamo?.id || '',
+      descripcion: `Pago préstamo — ${p.nombre}`,
+      monto: p.monto_sugerido != null ? String(p.monto_sugerido) : '',
+      capital: p.capital_sugerido != null ? String(p.capital_sugerido) : '',
+      intereses: p.intereses_sugerido != null ? String(p.intereses_sugerido) : '',
+    })
     setError(null); setModalOpen(true)
   }
+  const selectPrestatario = id => {
+    const p = prestatarios.find(x => String(x.id) === String(id))
+    setForm(f => ({
+      ...f, prestatario_id: id,
+      monto: p?.monto_sugerido != null ? String(p.monto_sugerido) : f.monto,
+      capital: p?.capital_sugerido != null ? String(p.capital_sugerido) : f.capital,
+      intereses: p?.intereses_sugerido != null ? String(p.intereses_sugerido) : f.intereses,
+    }))
+  }
+  // Al capturar el monto real o ajustar intereses, el capital se recalcula como la diferencia
+  const setMontoPrestamo = v => setForm(f => ({
+    ...f, monto: v,
+    capital: f.tipo === 'Préstamo' && f.prestatario_id && f.intereses !== '' ? (Number(v || 0) - Number(f.intereses || 0)).toFixed(2) : f.capital,
+  }))
+  const setInteresesPrestamo = v => setForm(f => ({
+    ...f, intereses: v,
+    capital: f.tipo === 'Préstamo' && f.prestatario_id ? (Number(f.monto || 0) - Number(v || 0)).toFixed(2) : f.capital,
+  }))
 
   const submit = async e => {
     e.preventDefault()
@@ -180,7 +204,7 @@ export default function Ingresos() {
             <div style={{ display: 'flex', gap: 12, marginBottom: 14 }}>
               <div style={{ flex: 1 }}>
                 <label style={labelStyle}>Monto total *</label>
-                <input style={inputStyle} type="number" step="0.01" placeholder="0.00" value={form.monto} onChange={e => set('monto', e.target.value)} />
+                <input style={inputStyle} type="number" step="0.01" placeholder="0.00" value={form.monto} onChange={e => form.tipo === 'Préstamo' ? setMontoPrestamo(e.target.value) : set('monto', e.target.value)} />
               </div>
               <div style={{ width: 160 }}>
                 <label style={labelStyle}>Moneda</label>
@@ -209,11 +233,23 @@ export default function Ingresos() {
               <>
                 <div style={{ marginBottom: 14 }}>
                   <label style={labelStyle}>Prestatario</label>
-                  <select style={inputStyle} value={form.prestatario_id} onChange={e => set('prestatario_id', e.target.value)}>
+                  <select style={inputStyle} value={form.prestatario_id} onChange={e => selectPrestatario(e.target.value)}>
                     <option value="">— Selecciona prestatario —</option>
                     {prestatarios.map(p => <option key={p.id} value={p.id}>{p.nombre} · Saldo: {fmtMoney(p.saldo_pendiente)}</option>)}
                   </select>
                 </div>
+                {(() => {
+                  const p = prestatarios.find(x => String(x.id) === String(form.prestatario_id))
+                  return p?.periodo_actual ? (
+                    <div style={{ marginBottom: 14, fontSize: 13, color: '#6D28D9', background: '#F5F3FF', borderRadius: 8, padding: '8px 12px' }}>
+                      💡 Pago {p.periodo_actual} de {p.numero_pagos} · Cuota sugerida: {fmtMoney(p.monto_sugerido)}
+                    </div>
+                  ) : p ? (
+                    <div style={{ marginBottom: 14, fontSize: 13, color: '#9ca3af' }}>
+                      Este prestatario no tiene plazo capturado — captura Capital e Intereses manualmente.
+                    </div>
+                  ) : null
+                })()}
                 <div style={{ display: 'flex', gap: 12, marginBottom: 14 }}>
                   <div style={{ flex: 1 }}>
                     <label style={labelStyle}>Capital</label>
@@ -221,7 +257,7 @@ export default function Ingresos() {
                   </div>
                   <div style={{ flex: 1 }}>
                     <label style={labelStyle}>Intereses</label>
-                    <input style={inputStyle} type="number" step="0.01" placeholder="0.00" value={form.intereses} onChange={e => set('intereses', e.target.value)} />
+                    <input style={inputStyle} type="number" step="0.01" placeholder="0.00" value={form.intereses} onChange={e => setInteresesPrestamo(e.target.value)} />
                   </div>
                 </div>
               </>

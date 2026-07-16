@@ -175,6 +175,8 @@ class PrestatarioIn(BaseModel):
     nombre            : str = Field(..., max_length=150)
     capital_original  : float = 0
     tasa_interes      : float = 0
+    pagos_por_anio    : int = Field(12, gt=0)
+    numero_pagos      : Optional[int] = Field(None, gt=0)
     fecha_prestamo    : Optional[date] = None
     fecha_vencimiento : Optional[date] = None
     notas             : Optional[str] = ""
@@ -450,6 +452,28 @@ def delete_fuente(fuente_id: int, uid=Depends(get_usuario_id), conn=Depends(get_
 # ════════════════════════════════════════
 #  CATÁLOGOS — PRESTATARIOS
 # ════════════════════════════════════════
+def calcular_amortizacion(capital_original, tasa_interes, pagos_por_anio, numero_pagos,
+                           capital_pagado, pagos_realizados):
+    """Amortización francesa (cuota fija). Retorna None si el préstamo no tiene plazo capturado."""
+    if not numero_pagos or not pagos_por_anio:
+        return None
+    i = (tasa_interes or 0) / 100 / pagos_por_anio
+    n = numero_pagos
+    cuota = capital_original * i / (1 - (1 + i) ** -n) if i > 0 else capital_original / n
+    saldo_actual = capital_original - (capital_pagado or 0)
+    periodo_actual = (pagos_realizados or 0) + 1
+    interes = round(saldo_actual * i, 2)
+    if periodo_actual >= n:
+        capital = round(saldo_actual, 2)
+    else:
+        capital = round(cuota - interes, 2)
+    return {
+        "monto_sugerido"    : round(capital + interes, 2),
+        "capital_sugerido"  : capital,
+        "intereses_sugerido": interes,
+        "periodo_actual"    : periodo_actual,
+    }
+
 @app.get("/api/catalogos/prestatarios")
 def get_prestatarios(
     incluir_inactivos: bool = False,
@@ -462,7 +486,8 @@ def get_prestatarios(
     cur.execute(f"""
         SELECT ID,NOMBRE,CAPITAL_ORIGINAL,CAPITAL_RECUPERADO,
                CAPITAL_ORIGINAL-CAPITAL_RECUPERADO AS SALDO_CAPITAL,
-               TASA_INTERES,FECHA_PRESTAMO,FECHA_VENCIMIENTO,ESTATUS,NOTAS,ACTIVO
+               TASA_INTERES,PAGOS_POR_ANIO,NUMERO_PAGOS,
+               FECHA_PRESTAMO,FECHA_VENCIMIENTO,ESTATUS,NOTAS,ACTIVO
         FROM PRESTATARIOS WHERE {where}
         ORDER BY ESTATUS,NOMBRE
     """, uid_val=uid)
@@ -473,38 +498,57 @@ def create_prestatario(body: PrestatarioIn, uid=Depends(get_usuario_id), conn=De
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO PRESTATARIOS(USUARIO_ID,NOMBRE,CAPITAL_ORIGINAL,TASA_INTERES,
+                                 PAGOS_POR_ANIO,NUMERO_PAGOS,
                                  FECHA_PRESTAMO,FECHA_VENCIMIENTO,NOTAS)
-        VALUES(:uid_val,:nombre_val,:capital_val,:tasa_val,:fp_val,:fv_val,:notas_val)
+        VALUES(:uid_val,:nombre_val,:capital_val,:tasa_val,:ppa_val,:np_val,:fp_val,:fv_val,:notas_val)
     """, uid_val=uid, nombre_val=body.nombre, capital_val=body.capital_original,
-         tasa_val=body.tasa_interes, fp_val=body.fecha_prestamo,
+         tasa_val=body.tasa_interes, ppa_val=body.pagos_por_anio, np_val=body.numero_pagos,
+         fp_val=body.fecha_prestamo,
          fv_val=body.fecha_vencimiento, notas_val=body.notas)
     conn.commit()
     return {"ok": True}
 
 @app.get("/api/catalogos/fuentes-prestamo")
 def get_fuentes_prestamo(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
-    """Retorna prestatarios activos como fuentes virtuales de ingreso tipo Préstamo"""
+    """Retorna prestatarios activos como fuentes virtuales de ingreso tipo Préstamo,
+    con el desglose capital/intereses sugerido para su próximo pago (amortización francesa)."""
     cur = conn.cursor()
     cur.execute("""
-        SELECT ID, NOMBRE,
-               CAPITAL_ORIGINAL - CAPITAL_RECUPERADO AS SALDO_PENDIENTE,
-               TASA_INTERES, ESTATUS
-        FROM PRESTATARIOS
-        WHERE USUARIO_ID=:uid_val AND ACTIVO=1 AND ESTATUS='Activo'
-        ORDER BY NOMBRE
+        SELECT P.ID, P.NOMBRE,
+               P.CAPITAL_ORIGINAL - P.CAPITAL_RECUPERADO AS SALDO_PENDIENTE,
+               P.CAPITAL_ORIGINAL, P.TASA_INTERES, P.PAGOS_POR_ANIO, P.NUMERO_PAGOS, P.ESTATUS,
+               NVL(SUM(PP.CAPITAL),0) AS CAPITAL_PAGADO, COUNT(PP.ID) AS PAGOS_REALIZADOS
+        FROM PRESTATARIOS P
+        LEFT JOIN PAGOS_PRESTAMO PP ON PP.PRESTATARIO_ID=P.ID
+        WHERE P.USUARIO_ID=:uid_val AND P.ACTIVO=1 AND P.ESTATUS='Activo'
+        GROUP BY P.ID, P.NOMBRE, P.CAPITAL_ORIGINAL, P.CAPITAL_RECUPERADO,
+                 P.TASA_INTERES, P.PAGOS_POR_ANIO, P.NUMERO_PAGOS, P.ESTATUS
+        ORDER BY P.NOMBRE
     """, uid_val=uid)
-    return rows_to_dict(cur)
+    prestatarios = rows_to_dict(cur)
+    for p in prestatarios:
+        sugerido = calcular_amortizacion(
+            p["capital_original"], p["tasa_interes"], p["pagos_por_anio"], p["numero_pagos"],
+            p["capital_pagado"], p["pagos_realizados"]
+        )
+        p["monto_sugerido"]     = sugerido["monto_sugerido"]     if sugerido else None
+        p["capital_sugerido"]   = sugerido["capital_sugerido"]   if sugerido else None
+        p["intereses_sugerido"] = sugerido["intereses_sugerido"] if sugerido else None
+        p["periodo_actual"]     = sugerido["periodo_actual"]     if sugerido else None
+    return prestatarios
 
 @app.put("/api/catalogos/prestatarios/{prest_id}")
 def update_prestatario(prest_id: int, body: PrestatarioIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
         UPDATE PRESTATARIOS SET NOMBRE=:nombre_val,CAPITAL_ORIGINAL=:capital_val,
-               TASA_INTERES=:tasa_val,FECHA_PRESTAMO=:fp_val,
+               TASA_INTERES=:tasa_val,PAGOS_POR_ANIO=:ppa_val,NUMERO_PAGOS=:np_val,
+               FECHA_PRESTAMO=:fp_val,
                FECHA_VENCIMIENTO=:fv_val,NOTAS=:notas_val
         WHERE ID=:id_val AND USUARIO_ID=:uid_val
     """, nombre_val=body.nombre, capital_val=body.capital_original,
-         tasa_val=body.tasa_interes, fp_val=body.fecha_prestamo,
+         tasa_val=body.tasa_interes, ppa_val=body.pagos_por_anio, np_val=body.numero_pagos,
+         fp_val=body.fecha_prestamo,
          fv_val=body.fecha_vencimiento, notas_val=body.notas,
          id_val=prest_id, uid_val=uid)
     conn.commit()
@@ -843,12 +887,14 @@ def balance_prestamos(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
         SELECT P.ID,P.NOMBRE,P.CAPITAL_ORIGINAL,P.CAPITAL_RECUPERADO,
                P.CAPITAL_ORIGINAL-P.CAPITAL_RECUPERADO AS SALDO_PENDIENTE,
                NVL(SUM(PP.INTERESES),0) AS INTERESES_COBRADOS,
-               P.TASA_INTERES,P.FECHA_PRESTAMO,P.FECHA_VENCIMIENTO,P.ESTATUS
+               P.TASA_INTERES,P.PAGOS_POR_ANIO,P.NUMERO_PAGOS,COUNT(PP.ID) AS PAGOS_REALIZADOS,
+               P.FECHA_PRESTAMO,P.FECHA_VENCIMIENTO,P.ESTATUS
         FROM PRESTATARIOS P
         LEFT JOIN PAGOS_PRESTAMO PP ON PP.PRESTATARIO_ID=P.ID
         WHERE P.USUARIO_ID=:uid_val
         GROUP BY P.ID,P.NOMBRE,P.CAPITAL_ORIGINAL,P.CAPITAL_RECUPERADO,
-                 P.TASA_INTERES,P.FECHA_PRESTAMO,P.FECHA_VENCIMIENTO,P.ESTATUS
+                 P.TASA_INTERES,P.PAGOS_POR_ANIO,P.NUMERO_PAGOS,
+                 P.FECHA_PRESTAMO,P.FECHA_VENCIMIENTO,P.ESTATUS
         ORDER BY P.ESTATUS,SALDO_PENDIENTE DESC
     """, uid_val=uid)
     return rows_to_dict(cur)
