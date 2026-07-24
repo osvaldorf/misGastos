@@ -11,7 +11,8 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List
 from datetime import date, datetime, timedelta
 from contextlib import asynccontextmanager
-import oracledb
+import psycopg2
+import psycopg2.pool
 import os
 import httpx
 import jwt
@@ -23,9 +24,7 @@ load_dotenv()
 # ────────────────────────────────────────
 #  CONFIGURACIÓN
 # ────────────────────────────────────────
-DB_USER      = os.getenv("DB_USER",     "ADMIN")
-DB_PASSWORD  = os.getenv("DB_PASSWORD", "")
-DB_DSN       = os.getenv("DB_DSN",      "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 JWT_SECRET   = os.getenv("JWT_SECRET",  "cambia_esto_en_produccion")
 JWT_ALG      = "HS256"
 JWT_EXP_H    = 720
@@ -36,31 +35,33 @@ EXCHANGE_KEY = os.getenv("EXCHANGE_API_KEY", "")
 # ────────────────────────────────────────
 #  POOL DE CONEXIONES
 # ────────────────────────────────────────
-pool: oracledb.ConnectionPool = None
+pool: psycopg2.pool.ThreadedConnectionPool = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
-    oracledb.init_oracle_client()
-    pool = oracledb.create_pool(
-        user      = DB_USER,
-        password  = DB_PASSWORD,
-        dsn       = DB_DSN,
-        min       = 2,
-        max       = 10,
-        increment = 1
+    pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn = 2,
+        maxconn = 10,
+        dsn     = DATABASE_URL,
+        options = "-c search_path=misgastos"
     )
-    print("✅ Pool Oracle conectado")
+    print("✅ Pool Postgres conectado")
     yield
-    pool.close()
-    print("🔌 Pool Oracle cerrado")
+    pool.closeall()
+    print("🔌 Pool Postgres cerrado")
 
 def get_conn():
-    conn = pool.acquire()
+    conn = pool.getconn()
     try:
         yield conn
     finally:
-        pool.release(conn)
+        # Si un endpoint lanzó una excepción antes de hacer commit, la transacción
+        # queda abierta/abortada — hay que cerrarla antes de reciclar la conexión
+        # al pool, o el siguiente request que la reciba fallará con
+        # "current transaction is aborted".
+        conn.rollback()
+        pool.putconn(conn)
 
 # ────────────────────────────────────────
 #  APP
@@ -116,10 +117,10 @@ async def get_tasa_cambio(moneda: str, conn) -> float:
     cur = conn.cursor()
     cur.execute("""
         SELECT TASA FROM TIPOS_CAMBIO
-        WHERE MONEDA_ORIGEN=:moneda_orig AND MONEDA_DESTINO='MXN'
-        AND TRUNC(FECHA_CONSULTA)=TRUNC(SYSDATE)
+        WHERE MONEDA_ORIGEN=%(moneda_orig)s AND MONEDA_DESTINO='MXN'
+        AND FECHA_CONSULTA::date = CURRENT_DATE
         FETCH FIRST 1 ROWS ONLY
-    """, moneda_orig=moneda)
+    """, {'moneda_orig': moneda})
     row = cur.fetchone()
     if row:
         return float(row[0])
@@ -133,8 +134,8 @@ async def get_tasa_cambio(moneda: str, conn) -> float:
     try:
         cur.execute("""
             INSERT INTO TIPOS_CAMBIO(MONEDA_ORIGEN,MONEDA_DESTINO,TASA)
-            VALUES(:moneda_orig,'MXN',:tasa_val)
-        """, moneda_orig=moneda, tasa_val=tasa)
+            VALUES(%(moneda_orig)s,'MXN',%(tasa_val)s)
+        """, {'moneda_orig': moneda, 'tasa_val': tasa})
         conn.commit()
     except Exception:
         pass
@@ -224,8 +225,8 @@ def health():
 def login(body: LoginRequest, request: Request, conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute(
-        "SELECT ID, NOMBRE, PASSWORD_HASH FROM USUARIOS WHERE EMAIL=:email_val AND ACTIVO=1",
-        email_val=body.email
+        "SELECT ID, NOMBRE, PASSWORD_HASH FROM USUARIOS WHERE EMAIL=%(email_val)s AND ACTIVO=1",
+        {'email_val': body.email}
     )
     row = cur.fetchone()
     if not row:
@@ -237,18 +238,18 @@ def login(body: LoginRequest, request: Request, conn=Depends(get_conn)):
     token = crear_token(uid, body.email)
     try:
         cur.execute("""
-            UPDATE SESIONES SET ACTIVA=0, LOGOUT_AT=SYSTIMESTAMP
-            WHERE USUARIO_ID=:uid_val AND ACTIVA=1
-        """, uid_val=uid)
+            UPDATE SESIONES SET ACTIVA=0, LOGOUT_AT=NOW()
+            WHERE USUARIO_ID=%(uid_val)s AND ACTIVA=1
+        """, {'uid_val': uid})
     except Exception:
         pass
     try:
         cur.execute("""
             INSERT INTO SESIONES (USUARIO_ID, EMAIL, NOMBRE, DEVICE, IP)
-            VALUES (:uid_val, :email_val, :nombre_val, 'web', :ip_val)
-        """, uid_val=uid, email_val=body.email.lower(),
-             nombre_val=nombre,
-             ip_val=request.headers.get("X-Forwarded-For", request.client.host).split(",")[0].strip())
+            VALUES (%(uid_val)s, %(email_val)s, %(nombre_val)s, 'web', %(ip_val)s)
+        """, {'uid_val': uid, 'email_val': body.email.lower(),
+              'nombre_val': nombre,
+              'ip_val': request.headers.get("X-Forwarded-For", request.client.host).split(",")[0].strip()})
         conn.commit()
     except Exception:
         pass
@@ -261,8 +262,8 @@ def register(body: LoginRequest, nombre: str, conn=Depends(get_conn)):
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO USUARIOS(NOMBRE,EMAIL,PASSWORD_HASH) VALUES(:nombre_val,:email_val,:pw_val)",
-            nombre_val=nombre, email_val=body.email, pw_val=pw_hash
+            "INSERT INTO USUARIOS(NOMBRE,EMAIL,PASSWORD_HASH) VALUES(%(nombre_val)s,%(email_val)s,%(pw_val)s)",
+            {'nombre_val': nombre, 'email_val': body.email, 'pw_val': pw_hash}
         )
         conn.commit()
     except Exception:
@@ -277,9 +278,9 @@ def get_categorias(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
         SELECT ID,NOMBRE,EMOJI,COLOR,ES_SISTEMA,ACTIVO
-        FROM CATEGORIAS WHERE USUARIO_ID=:uid_val AND ACTIVO=1
+        FROM CATEGORIAS WHERE USUARIO_ID=%(uid_val)s AND ACTIVO=1
         ORDER BY NOMBRE
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.post("/api/catalogos/categorias", status_code=201)
@@ -287,8 +288,8 @@ def create_categoria(body: CategoriaIn, uid=Depends(get_usuario_id), conn=Depend
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO CATEGORIAS(USUARIO_ID,NOMBRE,EMOJI,COLOR,ES_SISTEMA)
-        VALUES(:uid_val,:nombre_val,:emoji_val,:color_val,0)
-    """, uid_val=uid, nombre_val=body.nombre, emoji_val=body.emoji, color_val=body.color)
+        VALUES(%(uid_val)s,%(nombre_val)s,%(emoji_val)s,%(color_val)s,0)
+    """, {'uid_val': uid, 'nombre_val': body.nombre, 'emoji_val': body.emoji, 'color_val': body.color})
     conn.commit()
     return {"ok": True}
 
@@ -296,22 +297,22 @@ def create_categoria(body: CategoriaIn, uid=Depends(get_usuario_id), conn=Depend
 def update_categoria(cat_id: int, body: CategoriaIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        UPDATE CATEGORIAS SET NOMBRE=:nombre_val,EMOJI=:emoji_val,COLOR=:color_val
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, nombre_val=body.nombre, emoji_val=body.emoji, color_val=body.color, id_val=cat_id, uid_val=uid)
+        UPDATE CATEGORIAS SET NOMBRE=%(nombre_val)s,EMOJI=%(emoji_val)s,COLOR=%(color_val)s
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'nombre_val': body.nombre, 'emoji_val': body.emoji, 'color_val': body.color, 'id_val': cat_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
 @app.delete("/api/catalogos/categorias/{cat_id}")
 def delete_categoria(cat_id: int, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
-    cur.execute("SELECT ES_SISTEMA FROM CATEGORIAS WHERE ID=:id_val AND USUARIO_ID=:uid_val", id_val=cat_id, uid_val=uid)
+    cur.execute("SELECT ES_SISTEMA FROM CATEGORIAS WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s", {'id_val': cat_id, 'uid_val': uid})
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Categoría no encontrada")
     if row[0] == 1:
         raise HTTPException(status_code=400, detail="No se pueden eliminar categorías del sistema")
-    cur.execute("UPDATE CATEGORIAS SET ACTIVO=0 WHERE ID=:id_val", id_val=cat_id)
+    cur.execute("UPDATE CATEGORIAS SET ACTIVO=0 WHERE ID=%(id_val)s", {'id_val': cat_id})
     conn.commit()
     return {"ok": True}
 
@@ -323,11 +324,11 @@ def get_cuentas(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
         SELECT ID,NOMBRE,BANCO,TIPO_PAGO,MONEDA,COLOR,ACTIVO,
-               NVL(OPERA_GASTOS,1) AS OPERA_GASTOS,
+               COALESCE(OPERA_GASTOS,1) AS OPERA_GASTOS,
                CATEGORIA_LIQ
-        FROM CUENTAS WHERE USUARIO_ID=:uid_val AND ACTIVO=1
+        FROM CUENTAS WHERE USUARIO_ID=%(uid_val)s AND ACTIVO=1
         ORDER BY NOMBRE
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.post("/api/catalogos/cuentas", status_code=201)
@@ -335,9 +336,9 @@ def create_cuenta(body: CuentaIn, uid=Depends(get_usuario_id), conn=Depends(get_
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO CUENTAS(USUARIO_ID,NOMBRE,BANCO,TIPO_PAGO,MONEDA,COLOR)
-        VALUES(:uid_val,:nombre_val,:banco_val,:tipo_val,:moneda_val,:color_val)
-    """, uid_val=uid, nombre_val=body.nombre, banco_val=body.banco,
-         tipo_val=body.tipo_pago, moneda_val=body.moneda, color_val=body.color)
+        VALUES(%(uid_val)s,%(nombre_val)s,%(banco_val)s,%(tipo_val)s,%(moneda_val)s,%(color_val)s)
+    """, {'uid_val': uid, 'nombre_val': body.nombre, 'banco_val': body.banco,
+          'tipo_val': body.tipo_pago, 'moneda_val': body.moneda, 'color_val': body.color})
     conn.commit()
     return {"ok": True}
 
@@ -345,19 +346,19 @@ def create_cuenta(body: CuentaIn, uid=Depends(get_usuario_id), conn=Depends(get_
 def update_cuenta(cuenta_id: int, body: CuentaIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        UPDATE CUENTAS SET NOMBRE=:nombre_val,BANCO=:banco_val,TIPO_PAGO=:tipo_val,
-               MONEDA=:moneda_val,COLOR=:color_val
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, nombre_val=body.nombre, banco_val=body.banco, tipo_val=body.tipo_pago,
-         moneda_val=body.moneda, color_val=body.color, id_val=cuenta_id, uid_val=uid)
+        UPDATE CUENTAS SET NOMBRE=%(nombre_val)s,BANCO=%(banco_val)s,TIPO_PAGO=%(tipo_val)s,
+               MONEDA=%(moneda_val)s,COLOR=%(color_val)s
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'nombre_val': body.nombre, 'banco_val': body.banco, 'tipo_val': body.tipo_pago,
+          'moneda_val': body.moneda, 'color_val': body.color, 'id_val': cuenta_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
 @app.delete("/api/catalogos/cuentas/{cuenta_id}")
 def delete_cuenta(cuenta_id: int, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
-    cur.execute("UPDATE CUENTAS SET ACTIVO=0 WHERE ID=:id_val AND USUARIO_ID=:uid_val",
-                id_val=cuenta_id, uid_val=uid)
+    cur.execute("UPDATE CUENTAS SET ACTIVO=0 WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s",
+                {'id_val': cuenta_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -369,9 +370,9 @@ def get_destinatarios(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
         SELECT ID,NOMBRE,EMOJI,COLOR,ACTIVO
-        FROM DESTINATARIOS WHERE USUARIO_ID=:uid_val AND ACTIVO=1
+        FROM DESTINATARIOS WHERE USUARIO_ID=%(uid_val)s AND ACTIVO=1
         ORDER BY NOMBRE
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.post("/api/catalogos/destinatarios", status_code=201)
@@ -379,8 +380,8 @@ def create_destinatario(body: DestinatarioIn, uid=Depends(get_usuario_id), conn=
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO DESTINATARIOS(USUARIO_ID,NOMBRE,EMOJI,COLOR)
-        VALUES(:uid_val,:nombre_val,:emoji_val,:color_val)
-    """, uid_val=uid, nombre_val=body.nombre, emoji_val=body.emoji, color_val=body.color)
+        VALUES(%(uid_val)s,%(nombre_val)s,%(emoji_val)s,%(color_val)s)
+    """, {'uid_val': uid, 'nombre_val': body.nombre, 'emoji_val': body.emoji, 'color_val': body.color})
     conn.commit()
     return {"ok": True}
 
@@ -388,18 +389,18 @@ def create_destinatario(body: DestinatarioIn, uid=Depends(get_usuario_id), conn=
 def update_destinatario(dest_id: int, body: DestinatarioIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        UPDATE DESTINATARIOS SET NOMBRE=:nombre_val,EMOJI=:emoji_val,COLOR=:color_val
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, nombre_val=body.nombre, emoji_val=body.emoji, color_val=body.color,
-         id_val=dest_id, uid_val=uid)
+        UPDATE DESTINATARIOS SET NOMBRE=%(nombre_val)s,EMOJI=%(emoji_val)s,COLOR=%(color_val)s
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'nombre_val': body.nombre, 'emoji_val': body.emoji, 'color_val': body.color,
+          'id_val': dest_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
 @app.delete("/api/catalogos/destinatarios/{dest_id}")
 def delete_destinatario(dest_id: int, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
-    cur.execute("UPDATE DESTINATARIOS SET ACTIVO=0 WHERE ID=:id_val AND USUARIO_ID=:uid_val",
-                id_val=dest_id, uid_val=uid)
+    cur.execute("UPDATE DESTINATARIOS SET ACTIVO=0 WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s",
+                {'id_val': dest_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -411,9 +412,9 @@ def get_fuentes(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
         SELECT ID,NOMBRE,TIPO,FRECUENCIA,MONEDA,COLOR,ACTIVO
-        FROM FUENTES_INGRESO WHERE USUARIO_ID=:uid_val AND ACTIVO=1
+        FROM FUENTES_INGRESO WHERE USUARIO_ID=%(uid_val)s AND ACTIVO=1
         ORDER BY TIPO,NOMBRE
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.post("/api/catalogos/fuentes", status_code=201)
@@ -421,9 +422,9 @@ def create_fuente(body: FuenteIngresoIn, uid=Depends(get_usuario_id), conn=Depen
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO FUENTES_INGRESO(USUARIO_ID,NOMBRE,TIPO,FRECUENCIA,MONEDA,COLOR)
-        VALUES(:uid_val,:nombre_val,:tipo_val,:frec_val,:moneda_val,:color_val)
-    """, uid_val=uid, nombre_val=body.nombre, tipo_val=body.tipo,
-         frec_val=body.frecuencia, moneda_val=body.moneda, color_val=body.color)
+        VALUES(%(uid_val)s,%(nombre_val)s,%(tipo_val)s,%(frec_val)s,%(moneda_val)s,%(color_val)s)
+    """, {'uid_val': uid, 'nombre_val': body.nombre, 'tipo_val': body.tipo,
+          'frec_val': body.frecuencia, 'moneda_val': body.moneda, 'color_val': body.color})
     conn.commit()
     return {"ok": True}
 
@@ -431,19 +432,19 @@ def create_fuente(body: FuenteIngresoIn, uid=Depends(get_usuario_id), conn=Depen
 def update_fuente(fuente_id: int, body: FuenteIngresoIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        UPDATE FUENTES_INGRESO SET NOMBRE=:nombre_val,TIPO=:tipo_val,FRECUENCIA=:frec_val,
-               MONEDA=:moneda_val,COLOR=:color_val
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, nombre_val=body.nombre, tipo_val=body.tipo, frec_val=body.frecuencia,
-         moneda_val=body.moneda, color_val=body.color, id_val=fuente_id, uid_val=uid)
+        UPDATE FUENTES_INGRESO SET NOMBRE=%(nombre_val)s,TIPO=%(tipo_val)s,FRECUENCIA=%(frec_val)s,
+               MONEDA=%(moneda_val)s,COLOR=%(color_val)s
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'nombre_val': body.nombre, 'tipo_val': body.tipo, 'frec_val': body.frecuencia,
+          'moneda_val': body.moneda, 'color_val': body.color, 'id_val': fuente_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
 @app.delete("/api/catalogos/fuentes/{fuente_id}")
 def delete_fuente(fuente_id: int, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
-    cur.execute("UPDATE FUENTES_INGRESO SET ACTIVO=0 WHERE ID=:id_val AND USUARIO_ID=:uid_val",
-                id_val=fuente_id, uid_val=uid)
+    cur.execute("UPDATE FUENTES_INGRESO SET ACTIVO=0 WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s",
+                {'id_val': fuente_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -456,7 +457,7 @@ def get_prestatarios(
     uid=Depends(get_usuario_id), conn=Depends(get_conn)
 ):
     cur = conn.cursor()
-    where = "USUARIO_ID=:uid_val"
+    where = "USUARIO_ID=%(uid_val)s"
     if not incluir_inactivos:
         where += " AND ACTIVO=1"
     cur.execute(f"""
@@ -465,7 +466,7 @@ def get_prestatarios(
                TASA_INTERES,FECHA_PRESTAMO,FECHA_VENCIMIENTO,ESTATUS,NOTAS,ACTIVO
         FROM PRESTATARIOS WHERE {where}
         ORDER BY ESTATUS,NOMBRE
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.post("/api/catalogos/prestatarios", status_code=201)
@@ -474,10 +475,10 @@ def create_prestatario(body: PrestatarioIn, uid=Depends(get_usuario_id), conn=De
     cur.execute("""
         INSERT INTO PRESTATARIOS(USUARIO_ID,NOMBRE,CAPITAL_ORIGINAL,TASA_INTERES,
                                  FECHA_PRESTAMO,FECHA_VENCIMIENTO,NOTAS)
-        VALUES(:uid_val,:nombre_val,:capital_val,:tasa_val,:fp_val,:fv_val,:notas_val)
-    """, uid_val=uid, nombre_val=body.nombre, capital_val=body.capital_original,
-         tasa_val=body.tasa_interes, fp_val=body.fecha_prestamo,
-         fv_val=body.fecha_vencimiento, notas_val=body.notas)
+        VALUES(%(uid_val)s,%(nombre_val)s,%(capital_val)s,%(tasa_val)s,%(fp_val)s,%(fv_val)s,%(notas_val)s)
+    """, {'uid_val': uid, 'nombre_val': body.nombre, 'capital_val': body.capital_original,
+          'tasa_val': body.tasa_interes, 'fp_val': body.fecha_prestamo,
+          'fv_val': body.fecha_vencimiento, 'notas_val': body.notas})
     conn.commit()
     return {"ok": True}
 
@@ -490,23 +491,23 @@ def get_fuentes_prestamo(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
                CAPITAL_ORIGINAL - CAPITAL_RECUPERADO AS SALDO_PENDIENTE,
                TASA_INTERES, ESTATUS
         FROM PRESTATARIOS
-        WHERE USUARIO_ID=:uid_val AND ACTIVO=1 AND ESTATUS='Activo'
+        WHERE USUARIO_ID=%(uid_val)s AND ACTIVO=1 AND ESTATUS='Activo'
         ORDER BY NOMBRE
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.put("/api/catalogos/prestatarios/{prest_id}")
 def update_prestatario(prest_id: int, body: PrestatarioIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        UPDATE PRESTATARIOS SET NOMBRE=:nombre_val,CAPITAL_ORIGINAL=:capital_val,
-               TASA_INTERES=:tasa_val,FECHA_PRESTAMO=:fp_val,
-               FECHA_VENCIMIENTO=:fv_val,NOTAS=:notas_val
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, nombre_val=body.nombre, capital_val=body.capital_original,
-         tasa_val=body.tasa_interes, fp_val=body.fecha_prestamo,
-         fv_val=body.fecha_vencimiento, notas_val=body.notas,
-         id_val=prest_id, uid_val=uid)
+        UPDATE PRESTATARIOS SET NOMBRE=%(nombre_val)s,CAPITAL_ORIGINAL=%(capital_val)s,
+               TASA_INTERES=%(tasa_val)s,FECHA_PRESTAMO=%(fp_val)s,
+               FECHA_VENCIMIENTO=%(fv_val)s,NOTAS=%(notas_val)s
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'nombre_val': body.nombre, 'capital_val': body.capital_original,
+          'tasa_val': body.tasa_interes, 'fp_val': body.fecha_prestamo,
+          'fv_val': body.fecha_vencimiento, 'notas_val': body.notas,
+          'id_val': prest_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -515,8 +516,8 @@ def delete_prestatario(prest_id: int, uid=Depends(get_usuario_id), conn=Depends(
     cur = conn.cursor()
     cur.execute("""
         UPDATE PRESTATARIOS SET ACTIVO=0
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, id_val=prest_id, uid_val=uid)
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'id_val': prest_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -526,7 +527,7 @@ def get_tipos_cambio(conn=Depends(get_conn)):
     cur.execute("""
         SELECT MONEDA_ORIGEN,MONEDA_DESTINO,TASA,FECHA_CONSULTA
         FROM TIPOS_CAMBIO
-        WHERE TRUNC(FECHA_CONSULTA)=TRUNC(SYSDATE)
+        WHERE FECHA_CONSULTA::date = CURRENT_DATE
         ORDER BY MONEDA_ORIGEN
     """)
     return rows_to_dict(cur)
@@ -545,13 +546,13 @@ def get_gastos(
     offset      : int = 0,
     uid=Depends(get_usuario_id), conn=Depends(get_conn)
 ):
-    where  = ["G.USUARIO_ID=:uid_val"]
+    where  = ["G.USUARIO_ID=%(uid_val)s"]
     params = {"uid_val": uid}
-    if fecha_ini:    where.append("G.FECHA>=TO_DATE(:fi_val,'YYYY-MM-DD')");  params["fi_val"]  = str(fecha_ini)
-    if fecha_fin:    where.append("G.FECHA<=TO_DATE(:ff_val,'YYYY-MM-DD')");  params["ff_val"]  = str(fecha_fin)
-    if categoria_id: where.append("G.CATEGORIA_ID=:cat_val"); params["cat_val"] = categoria_id
-    if cuenta_id:    where.append("G.CUENTA_ID=:cta_val");    params["cta_val"] = cuenta_id
-    if dest_id:      where.append("G.DESTINATARIO_ID=:dest_val"); params["dest_val"] = dest_id
+    if fecha_ini:    where.append("G.FECHA>=%(fi_val)s");  params["fi_val"]  = fecha_ini
+    if fecha_fin:    where.append("G.FECHA<=%(ff_val)s");  params["ff_val"]  = fecha_fin
+    if categoria_id: where.append("G.CATEGORIA_ID=%(cat_val)s"); params["cat_val"] = categoria_id
+    if cuenta_id:    where.append("G.CUENTA_ID=%(cta_val)s");    params["cta_val"] = cuenta_id
+    if dest_id:      where.append("G.DESTINATARIO_ID=%(dest_val)s"); params["dest_val"] = dest_id
     params["offset_val"] = offset
     params["limit_val"]  = limit
     cur = conn.cursor()
@@ -567,8 +568,8 @@ def get_gastos(
         LEFT JOIN DESTINATARIOS D ON D.ID=G.DESTINATARIO_ID
         WHERE {' AND '.join(where)}
         ORDER BY G.FECHA DESC,G.CREATED_AT DESC
-        OFFSET :offset_val ROWS FETCH NEXT :limit_val ROWS ONLY
-    """, **params)
+        OFFSET %(offset_val)s ROWS FETCH NEXT %(limit_val)s ROWS ONLY
+    """, params)
     return rows_to_dict(cur)
 
 @app.get("/api/gastos/resumen")
@@ -580,20 +581,20 @@ def resumen_gastos(
     dest_id     : Optional[int]  = None,
     uid=Depends(get_usuario_id), conn=Depends(get_conn)
 ):
-    where  = ["G.USUARIO_ID=:uid_val"]
+    where  = ["G.USUARIO_ID=%(uid_val)s"]
     params = {"uid_val": uid}
-    if fecha_ini:    where.append("G.FECHA>=TO_DATE(:fi_val,'YYYY-MM-DD')");  params["fi_val"]  = str(fecha_ini)
-    if fecha_fin:    where.append("G.FECHA<=TO_DATE(:ff_val,'YYYY-MM-DD')"); params["ff_val"]  = str(fecha_fin)
-    if categoria_id: where.append("G.CATEGORIA_ID=:cat_val"); params["cat_val"] = categoria_id
-    if cuenta_id:    where.append("G.CUENTA_ID=:cta_val"); params["cta_val"] = cuenta_id
-    if dest_id:      where.append("G.DESTINATARIO_ID=:dest_val"); params["dest_val"] = dest_id
+    if fecha_ini:    where.append("G.FECHA>=%(fi_val)s");  params["fi_val"]  = fecha_ini
+    if fecha_fin:    where.append("G.FECHA<=%(ff_val)s"); params["ff_val"]  = fecha_fin
+    if categoria_id: where.append("G.CATEGORIA_ID=%(cat_val)s"); params["cat_val"] = categoria_id
+    if cuenta_id:    where.append("G.CUENTA_ID=%(cta_val)s"); params["cta_val"] = cuenta_id
+    if dest_id:      where.append("G.DESTINATARIO_ID=%(dest_val)s"); params["dest_val"] = dest_id
     cur = conn.cursor()
     cur.execute(f"""
-        SELECT NVL(COUNT(*),0) AS TOTAL_REGISTROS,
-               NVL(SUM(NVL(G.MONTO_MXN,G.MONTO)),0) AS TOTAL_MXN
+        SELECT COALESCE(COUNT(*),0) AS TOTAL_REGISTROS,
+               COALESCE(SUM(COALESCE(G.MONTO_MXN,G.MONTO)),0) AS TOTAL_MXN
         FROM GASTOS G
         WHERE {' AND '.join(where)}
-    """, **params)
+    """, params)
     row = cur.fetchone()
     return {
         "total_registros": int(row[0]),
@@ -608,13 +609,13 @@ async def create_gasto(body: GastoIn, uid=Depends(get_usuario_id), conn=Depends(
     cur.execute("""
         INSERT INTO GASTOS(USUARIO_ID,DESCRIPCION,MONTO,MONEDA,MONTO_MXN,TASA_CAMBIO,
                            FECHA,CATEGORIA_ID,CUENTA_ID,DESTINATARIO_ID,NOTAS,DEVICE)
-        VALUES(:uid_val,:descripcion_val,:monto_val,:moneda_val,:mxn_val,:tasa_val,
-               TO_DATE(:fecha_val,'YYYY-MM-DD'),:cat_val,:cta_val,:dest_val,:notas_val,:dev_val)
-    """, uid_val=uid, descripcion_val=body.descripcion, monto_val=body.monto,
-         moneda_val=body.moneda, mxn_val=monto_mxn, tasa_val=tasa,
-         fecha_val=str(body.fecha), cat_val=body.categoria_id,
-         cta_val=body.cuenta_id, dest_val=body.destinatario_id,
-         notas_val=body.notas, dev_val=body.device)
+        VALUES(%(uid_val)s,%(descripcion_val)s,%(monto_val)s,%(moneda_val)s,%(mxn_val)s,%(tasa_val)s,
+               %(fecha_val)s,%(cat_val)s,%(cta_val)s,%(dest_val)s,%(notas_val)s,%(dev_val)s)
+    """, {'uid_val': uid, 'descripcion_val': body.descripcion, 'monto_val': body.monto,
+          'moneda_val': body.moneda, 'mxn_val': monto_mxn, 'tasa_val': tasa,
+          'fecha_val': body.fecha, 'cat_val': body.categoria_id,
+          'cta_val': body.cuenta_id, 'dest_val': body.destinatario_id,
+          'notas_val': body.notas, 'dev_val': body.device})
     conn.commit()
     return {"ok": True, "monto_mxn": monto_mxn, "tasa_cambio": tasa}
 
@@ -624,25 +625,25 @@ async def update_gasto(gasto_id: int, body: GastoIn, uid=Depends(get_usuario_id)
     monto_mxn = round(body.monto * tasa, 2)
     cur = conn.cursor()
     cur.execute("""
-        UPDATE GASTOS SET DESCRIPCION=:descripcion_val,MONTO=:monto_val,MONEDA=:moneda_val,
-               MONTO_MXN=:mxn_val,TASA_CAMBIO=:tasa_val,
-               FECHA=TO_DATE(:fecha_val,'YYYY-MM-DD'),
-               CATEGORIA_ID=:cat_val,CUENTA_ID=:cta_val,
-               DESTINATARIO_ID=:dest_val,NOTAS=:notas_val
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, descripcion_val=body.descripcion, monto_val=body.monto, moneda_val=body.moneda,
-         mxn_val=monto_mxn, tasa_val=tasa, fecha_val=str(body.fecha),
-         cat_val=body.categoria_id, cta_val=body.cuenta_id,
-         dest_val=body.destinatario_id, notas_val=body.notas,
-         id_val=gasto_id, uid_val=uid)
+        UPDATE GASTOS SET DESCRIPCION=%(descripcion_val)s,MONTO=%(monto_val)s,MONEDA=%(moneda_val)s,
+               MONTO_MXN=%(mxn_val)s,TASA_CAMBIO=%(tasa_val)s,
+               FECHA=%(fecha_val)s,
+               CATEGORIA_ID=%(cat_val)s,CUENTA_ID=%(cta_val)s,
+               DESTINATARIO_ID=%(dest_val)s,NOTAS=%(notas_val)s
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'descripcion_val': body.descripcion, 'monto_val': body.monto, 'moneda_val': body.moneda,
+          'mxn_val': monto_mxn, 'tasa_val': tasa, 'fecha_val': body.fecha,
+          'cat_val': body.categoria_id, 'cta_val': body.cuenta_id,
+          'dest_val': body.destinatario_id, 'notas_val': body.notas,
+          'id_val': gasto_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
 @app.delete("/api/gastos/{gasto_id}")
 def delete_gasto(gasto_id: int, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
-    cur.execute("DELETE FROM GASTOS WHERE ID=:id_val AND USUARIO_ID=:uid_val",
-                id_val=gasto_id, uid_val=uid)
+    cur.execute("DELETE FROM GASTOS WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s",
+                {'id_val': gasto_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -660,13 +661,13 @@ def get_ingresos(
     offset    : int = 0,
     uid=Depends(get_usuario_id), conn=Depends(get_conn)
 ):
-    where  = ["I.USUARIO_ID=:uid_val"]
+    where  = ["I.USUARIO_ID=%(uid_val)s"]
     params = {"uid_val": uid}
-    if fecha_ini: where.append("I.FECHA>=TO_DATE(:fi_val,'YYYY-MM-DD')"); params["fi_val"]   = str(fecha_ini)
-    if fecha_fin: where.append("I.FECHA<=TO_DATE(:ff_val,'YYYY-MM-DD')"); params["ff_val"]   = str(fecha_fin)
-    if tipo:      where.append("I.TIPO=:tipo_val");      params["tipo_val"]  = tipo
-    if fuente_id: where.append("I.FUENTE_ID=:fid_val"); params["fid_val"]   = fuente_id
-    if cuenta_id: where.append("I.CUENTA_ID=:cid_val"); params["cid_val"]   = cuenta_id
+    if fecha_ini: where.append("I.FECHA>=%(fi_val)s"); params["fi_val"]   = fecha_ini
+    if fecha_fin: where.append("I.FECHA<=%(ff_val)s"); params["ff_val"]   = fecha_fin
+    if tipo:      where.append("I.TIPO=%(tipo_val)s");      params["tipo_val"]  = tipo
+    if fuente_id: where.append("I.FUENTE_ID=%(fid_val)s"); params["fid_val"]   = fuente_id
+    if cuenta_id: where.append("I.CUENTA_ID=%(cid_val)s"); params["cid_val"]   = cuenta_id
     params["offset_val"] = offset
     params["limit_val"]  = limit
     cur = conn.cursor()
@@ -684,8 +685,8 @@ def get_ingresos(
         LEFT JOIN PRESTATARIOS P    ON P.ID=PP.PRESTATARIO_ID
         WHERE {' AND '.join(where)}
         ORDER BY I.FECHA DESC,I.CREATED_AT DESC
-        OFFSET :offset_val ROWS FETCH NEXT :limit_val ROWS ONLY
-    """, **params)
+        OFFSET %(offset_val)s ROWS FETCH NEXT %(limit_val)s ROWS ONLY
+    """, params)
     return rows_to_dict(cur)
 
 @app.post("/api/ingresos", status_code=201)
@@ -702,35 +703,33 @@ async def create_ingreso(body: IngresoIn, uid=Depends(get_usuario_id), conn=Depe
     tasa      = await get_tasa_cambio(body.moneda, conn)
     monto_mxn = round(body.monto * tasa, 2)
     cur = conn.cursor()
-    ingreso_id_var = cur.var(int)
     cur.execute("""
         INSERT INTO INGRESOS(USUARIO_ID,DESCRIPCION,TIPO,FUENTE_ID,MONTO,MONEDA,
                              MONTO_MXN,TASA_CAMBIO,FECHA,CUENTA_ID,NOTAS,DEVICE)
-        VALUES(:uid_val,:descripcion_val,:tipo_val,:fid_val,:monto_val,:moneda_val,
-               :mxn_val,:tasa_val,TO_DATE(:fecha_val,'YYYY-MM-DD'),:cta_val,:notas_val,:dev_val)
-        RETURNING ID INTO :rid_val
-    """, uid_val=uid, descripcion_val=body.descripcion, tipo_val=body.tipo,
-         fid_val=body.fuente_id, monto_val=body.monto, moneda_val=body.moneda,
-         mxn_val=monto_mxn, tasa_val=tasa, fecha_val=str(body.fecha),
-         cta_val=body.cuenta_id, notas_val=body.notas, dev_val=body.device,
-         rid_val=ingreso_id_var)
-    ingreso_id = ingreso_id_var.getvalue()[0]
+        VALUES(%(uid_val)s,%(descripcion_val)s,%(tipo_val)s,%(fid_val)s,%(monto_val)s,%(moneda_val)s,
+               %(mxn_val)s,%(tasa_val)s,%(fecha_val)s,%(cta_val)s,%(notas_val)s,%(dev_val)s)
+        RETURNING ID
+    """, {'uid_val': uid, 'descripcion_val': body.descripcion, 'tipo_val': body.tipo,
+          'fid_val': body.fuente_id, 'monto_val': body.monto, 'moneda_val': body.moneda,
+          'mxn_val': monto_mxn, 'tasa_val': tasa, 'fecha_val': body.fecha,
+          'cta_val': body.cuenta_id, 'notas_val': body.notas, 'dev_val': body.device})
+    ingreso_id = cur.fetchone()[0]
     if body.tipo == "Préstamo" and body.prestatario_id:
         cur.execute("""
             INSERT INTO PAGOS_PRESTAMO(INGRESO_ID,PRESTATARIO_ID,CAPITAL,INTERESES,FECHA)
-            VALUES(:iid_val,:pid_val,:capital_val,:intereses_val,TO_DATE(:fecha_val,'YYYY-MM-DD'))
-        """, iid_val=ingreso_id, pid_val=body.prestatario_id,
-             capital_val=body.capital or 0, intereses_val=body.intereses or 0,
-             fecha_val=str(body.fecha))
+            VALUES(%(iid_val)s,%(pid_val)s,%(capital_val)s,%(intereses_val)s,%(fecha_val)s)
+        """, {'iid_val': ingreso_id, 'pid_val': body.prestatario_id,
+              'capital_val': body.capital or 0, 'intereses_val': body.intereses or 0,
+              'fecha_val': body.fecha})
     conn.commit()
     return {"ok": True, "ingreso_id": ingreso_id, "monto_mxn": monto_mxn}
 
 @app.delete("/api/ingresos/{ingreso_id}")
 def delete_ingreso(ingreso_id: int, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
-    cur.execute("DELETE FROM PAGOS_PRESTAMO WHERE INGRESO_ID=:id_val", id_val=ingreso_id)
-    cur.execute("DELETE FROM INGRESOS WHERE ID=:id_val AND USUARIO_ID=:uid_val",
-                id_val=ingreso_id, uid_val=uid)
+    cur.execute("DELETE FROM PAGOS_PRESTAMO WHERE INGRESO_ID=%(id_val)s", {'id_val': ingreso_id})
+    cur.execute("DELETE FROM INGRESOS WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s",
+                {'id_val': ingreso_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -741,21 +740,21 @@ def delete_ingreso(ingreso_id: int, uid=Depends(get_usuario_id), conn=Depends(ge
 def resumen_general(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        SELECT NVL(SUM(NVL(MONTO_MXN,MONTO)),0)
-        FROM GASTOS WHERE USUARIO_ID=:uid_val
-        AND TO_CHAR(FECHA,'YYYY-MM')=TO_CHAR(SYSDATE,'YYYY-MM')
-    """, uid_val=uid)
+        SELECT COALESCE(SUM(COALESCE(MONTO_MXN,MONTO)),0)
+        FROM GASTOS WHERE USUARIO_ID=%(uid_val)s
+        AND TO_CHAR(FECHA,'YYYY-MM')=TO_CHAR(CURRENT_DATE,'YYYY-MM')
+    """, {'uid_val': uid})
     gastos_mes = cur.fetchone()[0]
     cur.execute("""
-        SELECT NVL(SUM(NVL(MONTO_MXN,MONTO)),0)
-        FROM INGRESOS WHERE USUARIO_ID=:uid_val
-        AND TO_CHAR(FECHA,'YYYY-MM')=TO_CHAR(SYSDATE,'YYYY-MM')
-    """, uid_val=uid)
+        SELECT COALESCE(SUM(COALESCE(MONTO_MXN,MONTO)),0)
+        FROM INGRESOS WHERE USUARIO_ID=%(uid_val)s
+        AND TO_CHAR(FECHA,'YYYY-MM')=TO_CHAR(CURRENT_DATE,'YYYY-MM')
+    """, {'uid_val': uid})
     ingresos_mes = cur.fetchone()[0]
     cur.execute("""
-        SELECT COUNT(*),NVL(SUM(CAPITAL_ORIGINAL-CAPITAL_RECUPERADO),0)
-        FROM PRESTATARIOS WHERE USUARIO_ID=:uid_val AND ESTATUS='Activo'
-    """, uid_val=uid)
+        SELECT COUNT(*),COALESCE(SUM(CAPITAL_ORIGINAL-CAPITAL_RECUPERADO),0)
+        FROM PRESTATARIOS WHERE USUARIO_ID=%(uid_val)s AND ESTATUS='Activo'
+    """, {'uid_val': uid})
     pr = cur.fetchone()
     return {
         "gastos_mes_mxn"     : float(gastos_mes),
@@ -770,7 +769,7 @@ def flujo_mensual(anio: Optional[int] = None, uid=Depends(get_usuario_id), conn=
     params = {"uid_val": uid}
     where_extra = ""
     if anio:
-        where_extra = " AND EXTRACT(YEAR FROM FECHA)=:anio_val"
+        where_extra = " AND EXTRACT(YEAR FROM FECHA)=%(anio_val)s"
         params["anio_val"] = anio
     cur = conn.cursor()
     cur.execute(f"""
@@ -780,16 +779,16 @@ def flujo_mensual(anio: Optional[int] = None, uid=Depends(get_usuario_id), conn=
                SUM(CASE WHEN TIPO='Ingreso' THEN TOTAL ELSE -TOTAL END) AS FLUJO_NETO
         FROM (
             SELECT TO_CHAR(FECHA,'YYYY-MM') AS MES,'Ingreso' AS TIPO,
-                   SUM(NVL(MONTO_MXN,MONTO)) AS TOTAL
-            FROM INGRESOS WHERE USUARIO_ID=:uid_val{where_extra}
+                   SUM(COALESCE(MONTO_MXN,MONTO)) AS TOTAL
+            FROM INGRESOS WHERE USUARIO_ID=%(uid_val)s{where_extra}
             GROUP BY TO_CHAR(FECHA,'YYYY-MM')
             UNION ALL
             SELECT TO_CHAR(FECHA,'YYYY-MM') AS MES,'Gasto' AS TIPO,
-                   SUM(NVL(MONTO_MXN,MONTO)) AS TOTAL
-            FROM GASTOS WHERE USUARIO_ID=:uid_val{where_extra}
+                   SUM(COALESCE(MONTO_MXN,MONTO)) AS TOTAL
+            FROM GASTOS WHERE USUARIO_ID=%(uid_val)s{where_extra}
             GROUP BY TO_CHAR(FECHA,'YYYY-MM')
-        ) GROUP BY MES ORDER BY MES
-    """, **params)
+        ) AS t GROUP BY MES ORDER BY MES
+    """, params)
     return rows_to_dict(cur)
 
 @app.get("/api/balance/por-categoria")
@@ -798,19 +797,19 @@ def balance_por_categoria(
     fecha_fin: Optional[date] = None,
     uid=Depends(get_usuario_id), conn=Depends(get_conn)
 ):
-    where  = ["G.USUARIO_ID=:uid_val"]
+    where  = ["G.USUARIO_ID=%(uid_val)s"]
     params = {"uid_val": uid}
-    if fecha_ini: where.append("G.FECHA>=TO_DATE(:fi_val,'YYYY-MM-DD')"); params["fi_val"] = str(fecha_ini)
-    if fecha_fin: where.append("G.FECHA<=TO_DATE(:ff_val,'YYYY-MM-DD')"); params["ff_val"] = str(fecha_fin)
+    if fecha_ini: where.append("G.FECHA>=%(fi_val)s"); params["fi_val"] = fecha_ini
+    if fecha_fin: where.append("G.FECHA<=%(ff_val)s"); params["ff_val"] = fecha_fin
     cur = conn.cursor()
     cur.execute(f"""
         SELECT C.NOMBRE,C.EMOJI,C.COLOR,
-               SUM(NVL(G.MONTO_MXN,G.MONTO)) AS TOTAL_MXN,COUNT(*) AS REGISTROS
+               SUM(COALESCE(G.MONTO_MXN,G.MONTO)) AS TOTAL_MXN,COUNT(*) AS REGISTROS
         FROM GASTOS G JOIN CATEGORIAS C ON C.ID=G.CATEGORIA_ID
         WHERE {' AND '.join(where)}
         GROUP BY C.NOMBRE,C.EMOJI,C.COLOR
         ORDER BY TOTAL_MXN DESC
-    """, **params)
+    """, params)
     return rows_to_dict(cur)
 
 @app.get("/api/balance/por-fuente")
@@ -819,21 +818,21 @@ def balance_por_fuente(
     fecha_fin: Optional[date] = None,
     uid=Depends(get_usuario_id), conn=Depends(get_conn)
 ):
-    where  = ["I.USUARIO_ID=:uid_val"]
+    where  = ["I.USUARIO_ID=%(uid_val)s"]
     params = {"uid_val": uid}
-    if fecha_ini: where.append("I.FECHA>=TO_DATE(:fi_val,'YYYY-MM-DD')"); params["fi_val"] = str(fecha_ini)
-    if fecha_fin: where.append("I.FECHA<=TO_DATE(:ff_val,'YYYY-MM-DD')"); params["ff_val"] = str(fecha_fin)
+    if fecha_ini: where.append("I.FECHA>=%(fi_val)s"); params["fi_val"] = fecha_ini
+    if fecha_fin: where.append("I.FECHA<=%(ff_val)s"); params["ff_val"] = fecha_fin
     cur = conn.cursor()
     cur.execute(f"""
         SELECT F.NOMBRE,F.TIPO,F.MONEDA,F.COLOR,
                SUM(I.MONTO) AS TOTAL_MONEDA,
-               SUM(NVL(I.MONTO_MXN,I.MONTO)) AS TOTAL_MXN,
+               SUM(COALESCE(I.MONTO_MXN,I.MONTO)) AS TOTAL_MXN,
                COUNT(*) AS REGISTROS
         FROM INGRESOS I JOIN FUENTES_INGRESO F ON F.ID=I.FUENTE_ID
         WHERE {' AND '.join(where)}
         GROUP BY F.NOMBRE,F.TIPO,F.MONEDA,F.COLOR
         ORDER BY TOTAL_MXN DESC
-    """, **params)
+    """, params)
     return rows_to_dict(cur)
 
 @app.get("/api/balance/prestamos")
@@ -842,15 +841,15 @@ def balance_prestamos(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur.execute("""
         SELECT P.ID,P.NOMBRE,P.CAPITAL_ORIGINAL,P.CAPITAL_RECUPERADO,
                P.CAPITAL_ORIGINAL-P.CAPITAL_RECUPERADO AS SALDO_PENDIENTE,
-               NVL(SUM(PP.INTERESES),0) AS INTERESES_COBRADOS,
+               COALESCE(SUM(PP.INTERESES),0) AS INTERESES_COBRADOS,
                P.TASA_INTERES,P.FECHA_PRESTAMO,P.FECHA_VENCIMIENTO,P.ESTATUS
         FROM PRESTATARIOS P
         LEFT JOIN PAGOS_PRESTAMO PP ON PP.PRESTATARIO_ID=P.ID
-        WHERE P.USUARIO_ID=:uid_val
+        WHERE P.USUARIO_ID=%(uid_val)s
         GROUP BY P.ID,P.NOMBRE,P.CAPITAL_ORIGINAL,P.CAPITAL_RECUPERADO,
                  P.TASA_INTERES,P.FECHA_PRESTAMO,P.FECHA_VENCIMIENTO,P.ESTATUS
         ORDER BY P.ESTATUS,SALDO_PENDIENTE DESC
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.get("/api/balance/posicion-moneda")
@@ -862,11 +861,11 @@ def posicion_moneda(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
                SUM(CASE WHEN TIPO='Gasto'   THEN MONTO ELSE 0 END) AS GASTOS,
                SUM(CASE WHEN TIPO='Ingreso' THEN MONTO ELSE -MONTO END) AS POSICION_NETA
         FROM (
-            SELECT MONEDA,MONTO,'Ingreso' AS TIPO FROM INGRESOS WHERE USUARIO_ID=:uid_val
+            SELECT MONEDA,MONTO,'Ingreso' AS TIPO FROM INGRESOS WHERE USUARIO_ID=%(uid_val)s
             UNION ALL
-            SELECT MONEDA,MONTO,'Gasto' AS TIPO FROM GASTOS WHERE USUARIO_ID=:uid_val
-        ) GROUP BY MONEDA ORDER BY POSICION_NETA DESC
-    """, uid_val=uid)
+            SELECT MONEDA,MONTO,'Gasto' AS TIPO FROM GASTOS WHERE USUARIO_ID=%(uid_val)s
+        ) AS t GROUP BY MONEDA ORDER BY POSICION_NETA DESC
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 # ════════════════════════════════════════
 #  AUTH — CAMBIAR PASSWORD
@@ -878,7 +877,7 @@ class CambiarPasswordIn(BaseModel):
 @app.put("/api/auth/cambiar-password")
 def cambiar_password(body: CambiarPasswordIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
-    cur.execute("SELECT PASSWORD_HASH FROM USUARIOS WHERE ID=:uid_val", uid_val=uid)
+    cur.execute("SELECT PASSWORD_HASH FROM USUARIOS WHERE ID=%(uid_val)s", {'uid_val': uid})
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -886,8 +885,8 @@ def cambiar_password(body: CambiarPasswordIn, uid=Depends(get_usuario_id), conn=
         raise HTTPException(status_code=400, detail="La contraseña actual es incorrecta")
     nuevo_hash = bcrypt.hashpw(body.password_nuevo.encode(), bcrypt.gensalt()).decode()
     cur.execute(
-        "UPDATE USUARIOS SET PASSWORD_HASH=:hash_val WHERE ID=:uid_val",
-        hash_val=nuevo_hash, uid_val=uid
+        "UPDATE USUARIOS SET PASSWORD_HASH=%(hash_val)s WHERE ID=%(uid_val)s",
+        {'hash_val': nuevo_hash, 'uid_val': uid}
     )
     conn.commit()
     return {"ok": True}
@@ -899,8 +898,8 @@ def cambiar_password(body: CambiarPasswordIn, uid=Depends(get_usuario_id), conn=
 def onboarding_status(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute(
-        "SELECT ONBOARDING_COMPLETADO FROM USUARIOS WHERE ID=:uid_val",
-        uid_val=uid
+        "SELECT ONBOARDING_COMPLETADO FROM USUARIOS WHERE ID=%(uid_val)s",
+        {'uid_val': uid}
     )
     row = cur.fetchone()
     return {"completado": bool(row[0]) if row else False}
@@ -909,8 +908,8 @@ def onboarding_status(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
 def onboarding_completar(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute(
-        "UPDATE USUARIOS SET ONBOARDING_COMPLETADO=1 WHERE ID=:uid_val",
-        uid_val=uid
+        "UPDATE USUARIOS SET ONBOARDING_COMPLETADO=1 WHERE ID=%(uid_val)s",
+        {'uid_val': uid}
     )
     conn.commit()
     return {"ok": True}
@@ -950,13 +949,13 @@ def tarjetas_resumen(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
         SELECT
-            NVL(SUM(NVL(E.DEUDOR_TOTAL, 0)), 0)   AS DEUDA_TOTAL,
-            NVL(SUM(T.LIMITE_CREDITO), 0)          AS LIMITE_TOTAL,
-            CASE WHEN NVL(SUM(T.LIMITE_CREDITO),0) > 0
-                 THEN ROUND(SUM(NVL(E.DEUDOR_TOTAL,0)) /
+            COALESCE(SUM(COALESCE(E.DEUDOR_TOTAL, 0)), 0)   AS DEUDA_TOTAL,
+            COALESCE(SUM(T.LIMITE_CREDITO), 0)          AS LIMITE_TOTAL,
+            CASE WHEN COALESCE(SUM(T.LIMITE_CREDITO),0) > 0
+                 THEN ROUND(SUM(COALESCE(E.DEUDOR_TOTAL,0)) /
                             SUM(T.LIMITE_CREDITO) * 100, 1)
                  ELSE 0 END                        AS UTILIZACION_PCT,
-            MIN(CASE WHEN E.FECHA_LIMITE >= TRUNC(SYSDATE)
+            MIN(CASE WHEN E.FECHA_LIMITE >= CURRENT_DATE
                      THEN E.FECHA_LIMITE END)      AS PROX_VCTO,
             COUNT(T.ID)                            AS TOTAL_TARJETAS
         FROM TARJETAS_CREDITO T
@@ -966,8 +965,8 @@ def tarjetas_resumen(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
                        ORDER BY E1.ANIO DESC, E1.MES DESC) AS RN
             FROM ESTADOS_TARJETA E1
         ) E ON E.TARJETA_ID = T.ID AND E.RN = 1
-        WHERE T.USUARIO_ID = :uid_val AND T.ACTIVO = 1
-    """, uid_val=uid)
+        WHERE T.USUARIO_ID = %(uid_val)s AND T.ACTIVO = 1
+    """, {'uid_val': uid})
     row = cur.fetchone()
     return {
         "deuda_total"    : float(row[0] or 0),
@@ -985,11 +984,11 @@ def get_tarjetas(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
             T.ID, T.CUENTA_ID, T.LIMITE_CREDITO, T.DIA_CORTE,
             T.DIAS_PARA_PAGO, T.TASA_ANUAL, T.ACTIVO,
             C.NOMBRE AS CUENTA_NOMBRE, C.BANCO, C.COLOR, C.MONEDA,
-            NVL(E.DEUDOR_TOTAL,  0) AS DEUDOR_TOTAL,
-            NVL(E.SALDO_REGULAR, 0) AS SALDO_REGULAR,
-            NVL(E.SALDO_MESES,   0) AS SALDO_MESES,
-            NVL(E.PAGO_PNGI,     0) AS PAGO_PNGI,
-            NVL(E.PAGO_MINIMO,   0) AS PAGO_MINIMO,
+            COALESCE(E.DEUDOR_TOTAL,  0) AS DEUDOR_TOTAL,
+            COALESCE(E.SALDO_REGULAR, 0) AS SALDO_REGULAR,
+            COALESCE(E.SALDO_MESES,   0) AS SALDO_MESES,
+            COALESCE(E.PAGO_PNGI,     0) AS PAGO_PNGI,
+            COALESCE(E.PAGO_MINIMO,   0) AS PAGO_MINIMO,
             E.FECHA_LIMITE,
             E.FECHA_CORTE,
             E.ANIO AS ULTIMO_ANIO,
@@ -1002,25 +1001,22 @@ def get_tarjetas(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
                        ORDER BY E1.ANIO DESC, E1.MES DESC) AS RN
             FROM ESTADOS_TARJETA E1
         ) E ON E.TARJETA_ID = T.ID AND E.RN = 1
-        WHERE T.USUARIO_ID = :uid_val AND T.ACTIVO = 1
+        WHERE T.USUARIO_ID = %(uid_val)s AND T.ACTIVO = 1
         ORDER BY C.NOMBRE
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.post("/api/tarjetas", status_code=201)
 def create_tarjeta(body: TarjetaIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        MERGE INTO TARJETAS_CREDITO t
-        USING DUAL ON (t.USUARIO_ID=:uid_val AND t.CUENTA_ID=:cta_val)
-        WHEN MATCHED THEN
-            UPDATE SET LIMITE_CREDITO=:lim_val, DIA_CORTE=:dc_val,
-                       DIAS_PARA_PAGO=:dp_val, TASA_ANUAL=:tasa_val, ACTIVO=1
-        WHEN NOT MATCHED THEN
-            INSERT (USUARIO_ID,CUENTA_ID,LIMITE_CREDITO,DIA_CORTE,DIAS_PARA_PAGO,TASA_ANUAL)
-            VALUES (:uid_val,:cta_val,:lim_val,:dc_val,:dp_val,:tasa_val)
-    """, uid_val=uid, cta_val=body.cuenta_id, lim_val=body.limite_credito,
-         dc_val=body.dia_corte, dp_val=body.dias_para_pago, tasa_val=body.tasa_anual)
+        INSERT INTO TARJETAS_CREDITO (USUARIO_ID,CUENTA_ID,LIMITE_CREDITO,DIA_CORTE,DIAS_PARA_PAGO,TASA_ANUAL,ACTIVO)
+        VALUES (%(uid_val)s,%(cta_val)s,%(lim_val)s,%(dc_val)s,%(dp_val)s,%(tasa_val)s,1)
+        ON CONFLICT (CUENTA_ID) DO UPDATE SET
+            LIMITE_CREDITO=EXCLUDED.LIMITE_CREDITO, DIA_CORTE=EXCLUDED.DIA_CORTE,
+            DIAS_PARA_PAGO=EXCLUDED.DIAS_PARA_PAGO, TASA_ANUAL=EXCLUDED.TASA_ANUAL, ACTIVO=1
+    """, {'uid_val': uid, 'cta_val': body.cuenta_id, 'lim_val': body.limite_credito,
+          'dc_val': body.dia_corte, 'dp_val': body.dias_para_pago, 'tasa_val': body.tasa_anual})
     conn.commit()
     return {"ok": True}
 
@@ -1030,12 +1026,12 @@ def update_tarjeta(tarjeta_id: int, body: TarjetaIn,
     cur = conn.cursor()
     cur.execute("""
         UPDATE TARJETAS_CREDITO
-        SET LIMITE_CREDITO=:lim_val, DIA_CORTE=:dc_val,
-            DIAS_PARA_PAGO=:dp_val, TASA_ANUAL=:tasa_val
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, lim_val=body.limite_credito, dc_val=body.dia_corte,
-         dp_val=body.dias_para_pago, tasa_val=body.tasa_anual,
-         id_val=tarjeta_id, uid_val=uid)
+        SET LIMITE_CREDITO=%(lim_val)s, DIA_CORTE=%(dc_val)s,
+            DIAS_PARA_PAGO=%(dp_val)s, TASA_ANUAL=%(tasa_val)s
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'lim_val': body.limite_credito, 'dc_val': body.dia_corte,
+          'dp_val': body.dias_para_pago, 'tasa_val': body.tasa_anual,
+          'id_val': tarjeta_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -1043,8 +1039,8 @@ def update_tarjeta(tarjeta_id: int, body: TarjetaIn,
 def delete_tarjeta(tarjeta_id: int, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute(
-        "UPDATE TARJETAS_CREDITO SET ACTIVO=0 WHERE ID=:id_val AND USUARIO_ID=:uid_val",
-        id_val=tarjeta_id, uid_val=uid
+        "UPDATE TARJETAS_CREDITO SET ACTIVO=0 WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s",
+        {'id_val': tarjeta_id, 'uid_val': uid}
     )
     conn.commit()
     return {"ok": True}
@@ -1061,10 +1057,10 @@ def get_estados(tarjeta_id: int, uid=Depends(get_usuario_id), conn=Depends(get_c
                E.SALDO_REGULAR, E.SALDO_MESES, E.DEUDOR_TOTAL, E.NOTAS
         FROM ESTADOS_TARJETA E
         JOIN TARJETAS_CREDITO T ON T.ID = E.TARJETA_ID
-        WHERE E.TARJETA_ID=:tid_val AND T.USUARIO_ID=:uid_val
+        WHERE E.TARJETA_ID=%(tid_val)s AND T.USUARIO_ID=%(uid_val)s
         ORDER BY E.ANIO DESC, E.MES DESC
         FETCH FIRST 24 ROWS ONLY
-    """, tid_val=tarjeta_id, uid_val=uid)
+    """, {'tid_val': tarjeta_id, 'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.post("/api/tarjetas/{tarjeta_id}/estados", status_code=201)
@@ -1072,8 +1068,8 @@ def upsert_estado(tarjeta_id: int, body: EstadoTarjetaIn,
                   uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute(
-        "SELECT ID FROM TARJETAS_CREDITO WHERE ID=:id_val AND USUARIO_ID=:uid_val AND ACTIVO=1",
-        id_val=tarjeta_id, uid_val=uid
+        "SELECT ID FROM TARJETAS_CREDITO WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s AND ACTIVO=1",
+        {'id_val': tarjeta_id, 'uid_val': uid}
     )
     if not cur.fetchone():
         raise HTTPException(status_code=404, detail="Tarjeta no encontrada")
@@ -1084,23 +1080,9 @@ def upsert_estado(tarjeta_id: int, body: EstadoTarjetaIn,
     )
     saldo_msi = body.saldo_meses if body.saldo_meses is not None else body.cargos_meses
     deudor    = body.deudor_total if body.deudor_total is not None else round(saldo_reg + saldo_msi, 2)
-    fc_val    = str(body.fecha_corte)  if body.fecha_corte  else None
-    fl_val    = str(body.fecha_limite) if body.fecha_limite else None
 
     cur.execute("""
-        MERGE INTO ESTADOS_TARJETA e
-        USING DUAL ON (e.TARJETA_ID=:tid_val AND e.ANIO=:anio_val AND e.MES=:mes_val)
-        WHEN MATCHED THEN UPDATE SET
-            FECHA_CORTE=TO_DATE(:fc_val,'YYYY-MM-DD'),
-            FECHA_LIMITE=TO_DATE(:fl_val,'YYYY-MM-DD'),
-            ADEUDO_ANTERIOR=:aa_val, CARGOS_REGULARES=:cr_val,
-            CARGOS_MESES=:cm_val,   INTERESES=:int_val,
-            COMISIONES=:com_val,    IVA=:iva_val,
-            PAGO_MINIMO=:pm_val,    PAGO_PNGI=:pp_val,
-            PAGO_REAL=:pr_val,      TASA=:tasa_val,
-            SALDO_REGULAR=:sr_val,  SALDO_MESES=:sm_val,
-            DEUDOR_TOTAL=:dt_val,   NOTAS=:notas_val
-        WHEN NOT MATCHED THEN INSERT
+        INSERT INTO ESTADOS_TARJETA
             (USUARIO_ID,TARJETA_ID,ANIO,MES,
              FECHA_CORTE,FECHA_LIMITE,
              ADEUDO_ANTERIOR,CARGOS_REGULARES,CARGOS_MESES,
@@ -1108,20 +1090,30 @@ def upsert_estado(tarjeta_id: int, body: EstadoTarjetaIn,
              PAGO_MINIMO,PAGO_PNGI,PAGO_REAL,
              TASA,SALDO_REGULAR,SALDO_MESES,DEUDOR_TOTAL,NOTAS)
         VALUES
-            (:uid_val,:tid_val,:anio_val,:mes_val,
-             TO_DATE(:fc_val,'YYYY-MM-DD'),TO_DATE(:fl_val,'YYYY-MM-DD'),
-             :aa_val,:cr_val,:cm_val,:int_val,:com_val,:iva_val,
-             :pm_val,:pp_val,:pr_val,:tasa_val,:sr_val,:sm_val,:dt_val,:notas_val)
-    """,
-    uid_val=uid, tid_val=tarjeta_id, anio_val=body.anio, mes_val=body.mes,
-    fc_val=fc_val, fl_val=fl_val,
-    aa_val=body.adeudo_anterior,  cr_val=body.cargos_regulares,
-    cm_val=body.cargos_meses,     int_val=body.intereses,
-    com_val=body.comisiones,      iva_val=body.iva,
-    pm_val=body.pago_minimo,      pp_val=body.pago_pngi,
-    pr_val=body.pago_real,        tasa_val=body.tasa,
-    sr_val=saldo_reg,             sm_val=saldo_msi,
-    dt_val=deudor,                notas_val=body.notas)
+            (%(uid_val)s,%(tid_val)s,%(anio_val)s,%(mes_val)s,
+             %(fc_val)s,%(fl_val)s,
+             %(aa_val)s,%(cr_val)s,%(cm_val)s,%(int_val)s,%(com_val)s,%(iva_val)s,
+             %(pm_val)s,%(pp_val)s,%(pr_val)s,%(tasa_val)s,%(sr_val)s,%(sm_val)s,%(dt_val)s,%(notas_val)s)
+        ON CONFLICT (TARJETA_ID, ANIO, MES) DO UPDATE SET
+            FECHA_CORTE=EXCLUDED.FECHA_CORTE,
+            FECHA_LIMITE=EXCLUDED.FECHA_LIMITE,
+            ADEUDO_ANTERIOR=EXCLUDED.ADEUDO_ANTERIOR, CARGOS_REGULARES=EXCLUDED.CARGOS_REGULARES,
+            CARGOS_MESES=EXCLUDED.CARGOS_MESES,       INTERESES=EXCLUDED.INTERESES,
+            COMISIONES=EXCLUDED.COMISIONES,           IVA=EXCLUDED.IVA,
+            PAGO_MINIMO=EXCLUDED.PAGO_MINIMO,          PAGO_PNGI=EXCLUDED.PAGO_PNGI,
+            PAGO_REAL=EXCLUDED.PAGO_REAL,              TASA=EXCLUDED.TASA,
+            SALDO_REGULAR=EXCLUDED.SALDO_REGULAR,      SALDO_MESES=EXCLUDED.SALDO_MESES,
+            DEUDOR_TOTAL=EXCLUDED.DEUDOR_TOTAL,        NOTAS=EXCLUDED.NOTAS
+    """, {
+        'uid_val': uid, 'tid_val': tarjeta_id, 'anio_val': body.anio, 'mes_val': body.mes,
+        'fc_val': body.fecha_corte, 'fl_val': body.fecha_limite,
+        'aa_val': body.adeudo_anterior,  'cr_val': body.cargos_regulares,
+        'cm_val': body.cargos_meses,     'int_val': body.intereses,
+        'com_val': body.comisiones,      'iva_val': body.iva,
+        'pm_val': body.pago_minimo,      'pp_val': body.pago_pngi,
+        'pr_val': body.pago_real,        'tasa_val': body.tasa,
+        'sr_val': saldo_reg,             'sm_val': saldo_msi,
+        'dt_val': deudor,                'notas_val': body.notas})
     conn.commit()
     return {"ok": True, "deudor_total": deudor}
 
@@ -1163,12 +1155,12 @@ def get_usuarios_admin(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
 def session_ping(request: Request, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        UPDATE SESIONES SET LAST_SEEN_AT = SYSTIMESTAMP
-        WHERE USUARIO_ID = :uid_val AND ACTIVA = 1
+        UPDATE SESIONES SET LAST_SEEN_AT = NOW()
+        WHERE USUARIO_ID = %(uid_val)s AND ACTIVA = 1
         AND LOGIN_AT = (
-            SELECT MAX(LOGIN_AT) FROM SESIONES WHERE USUARIO_ID = :uid_val2
+            SELECT MAX(LOGIN_AT) FROM SESIONES WHERE USUARIO_ID = %(uid_val2)s
         )
-    """, uid_val=uid, uid_val2=uid)
+    """, {'uid_val': uid, 'uid_val2': uid})
     conn.commit()
     return {"ok": True}
 
@@ -1197,11 +1189,11 @@ def update_cuenta_patrimonio(cuenta_id: int, body: PatrimonioCuentaIn,
     cur = conn.cursor()
     cur.execute("""
         UPDATE CUENTAS
-        SET CATEGORIA_LIQ=:cat_val, OPERA_GASTOS=:opera_val
-        WHERE ID=:id_val AND USUARIO_ID=:uid_val
-    """, cat_val=body.categoria_liq or None,
-         opera_val=body.opera_gastos,
-         id_val=cuenta_id, uid_val=uid)
+        SET CATEGORIA_LIQ=%(cat_val)s, OPERA_GASTOS=%(opera_val)s
+        WHERE ID=%(id_val)s AND USUARIO_ID=%(uid_val)s
+    """, {'cat_val': body.categoria_liq or None,
+          'opera_val': body.opera_gastos,
+          'id_val': cuenta_id, 'uid_val': uid})
     conn.commit()
     return {"ok": True}
 
@@ -1211,10 +1203,10 @@ def patrimonio_cuentas(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur.execute("""
         SELECT ID, NOMBRE, BANCO, MONEDA, CATEGORIA_LIQ
         FROM CUENTAS
-        WHERE USUARIO_ID=:uid_val AND ACTIVO=1
+        WHERE USUARIO_ID=%(uid_val)s AND ACTIVO=1
           AND CATEGORIA_LIQ IS NOT NULL
         ORDER BY CATEGORIA_LIQ, NOMBRE
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return rows_to_dict(cur)
 
 @app.get("/api/patrimonio/saldos")
@@ -1225,13 +1217,13 @@ def patrimonio_saldos_periodo(
     cur = conn.cursor()
     cur.execute("""
         SELECT SM.CUENTA_ID, SM.SALDO, SM.MONEDA, SM.TASA_CAMBIO,
-               NVL(SM.SALDO_MXN, SM.SALDO) AS SALDO_MXN, SM.NOTAS,
+               COALESCE(SM.SALDO_MXN, SM.SALDO) AS SALDO_MXN, SM.NOTAS,
                C.NOMBRE AS CUENTA_NOMBRE, C.CATEGORIA_LIQ
         FROM SALDOS_MES SM
         JOIN CUENTAS C ON C.ID = SM.CUENTA_ID
-        WHERE SM.USUARIO_ID=:uid_val AND SM.ANIO=:anio_val AND SM.MES=:mes_val
+        WHERE SM.USUARIO_ID=%(uid_val)s AND SM.ANIO=%(anio_val)s AND SM.MES=%(mes_val)s
         ORDER BY C.CATEGORIA_LIQ, C.NOMBRE
-    """, uid_val=uid, anio_val=anio, mes_val=mes)
+    """, {'uid_val': uid, 'anio_val': anio, 'mes_val': mes})
     return rows_to_dict(cur)
 
 @app.get("/api/patrimonio/saldos/ultimo-mes")
@@ -1240,14 +1232,14 @@ def patrimonio_ultimo_mes(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur.execute("""
         SELECT SM.CUENTA_ID, SM.SALDO, SM.MONEDA, SM.TASA_CAMBIO
         FROM SALDOS_MES SM
-        WHERE SM.USUARIO_ID = :uid_val
+        WHERE SM.USUARIO_ID = %(uid_val)s
           AND (SM.ANIO, SM.MES) = (
               SELECT ANIO, MES FROM SALDOS_MES
-              WHERE USUARIO_ID = :uid_val2
+              WHERE USUARIO_ID = %(uid_val2)s
               ORDER BY ANIO DESC, MES DESC
               FETCH FIRST 1 ROWS ONLY
           )
-    """, uid_val=uid, uid_val2=uid)
+    """, {'uid_val': uid, 'uid_val2': uid})
     saldos = [{"cuenta_id": r[0], "saldo": float(r[1] or 0),
                "moneda": r[2], "tasa_cambio": float(r[3] or 1)} for r in cur.fetchall()]
     return {"saldos": saldos}
@@ -1258,21 +1250,17 @@ def patrimonio_guardar_mes(body: SaldosMesIn, uid=Depends(get_usuario_id), conn=
     for item in body.saldos:
         saldo_mxn = round(item.saldo * item.tasa_cambio, 2)
         cur.execute("""
-            MERGE INTO SALDOS_MES sm
-            USING DUAL ON (sm.USUARIO_ID=:uid_val AND sm.CUENTA_ID=:cta_val
-                           AND sm.ANIO=:anio_val AND sm.MES=:mes_val)
-            WHEN MATCHED THEN
-                UPDATE SET SALDO=:saldo_val, MONEDA=:mon_val,
-                           TASA_CAMBIO=:tasa_val, SALDO_MXN=:mxn_val,
-                           NOTAS=:notas_val
-            WHEN NOT MATCHED THEN
-                INSERT (USUARIO_ID, CUENTA_ID, ANIO, MES, SALDO, MONEDA,
-                        TASA_CAMBIO, SALDO_MXN, NOTAS)
-                VALUES (:uid_val, :cta_val, :anio_val, :mes_val, :saldo_val,
-                        :mon_val, :tasa_val, :mxn_val, :notas_val)
-        """, uid_val=uid, cta_val=item.cuenta_id, anio_val=body.anio, mes_val=body.mes,
-             saldo_val=item.saldo, mon_val=item.moneda, tasa_val=item.tasa_cambio,
-             mxn_val=saldo_mxn, notas_val=item.notas)
+            INSERT INTO SALDOS_MES (USUARIO_ID, CUENTA_ID, ANIO, MES, SALDO, MONEDA,
+                    TASA_CAMBIO, SALDO_MXN, NOTAS)
+            VALUES (%(uid_val)s, %(cta_val)s, %(anio_val)s, %(mes_val)s, %(saldo_val)s,
+                    %(mon_val)s, %(tasa_val)s, %(mxn_val)s, %(notas_val)s)
+            ON CONFLICT (USUARIO_ID, CUENTA_ID, ANIO, MES) DO UPDATE SET
+                SALDO=EXCLUDED.SALDO, MONEDA=EXCLUDED.MONEDA,
+                TASA_CAMBIO=EXCLUDED.TASA_CAMBIO, SALDO_MXN=EXCLUDED.SALDO_MXN,
+                NOTAS=EXCLUDED.NOTAS
+        """, {'uid_val': uid, 'cta_val': item.cuenta_id, 'anio_val': body.anio, 'mes_val': body.mes,
+              'saldo_val': item.saldo, 'mon_val': item.moneda, 'tasa_val': item.tasa_cambio,
+              'mxn_val': saldo_mxn, 'notas_val': item.notas})
     conn.commit()
     return {"ok": True}
 
@@ -1281,9 +1269,9 @@ def patrimonio_resumen(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     # Último período capturado
     cur.execute("""
-        SELECT ANIO, MES FROM SALDOS_MES WHERE USUARIO_ID=:uid_val
+        SELECT ANIO, MES FROM SALDOS_MES WHERE USUARIO_ID=%(uid_val)s
         ORDER BY ANIO DESC, MES DESC FETCH FIRST 1 ROWS ONLY
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     ultimo = cur.fetchone()
     if not ultimo:
         return {"sin_datos": True}
@@ -1292,13 +1280,13 @@ def patrimonio_resumen(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
 
     # Totales por categoría del último período
     cur.execute("""
-        SELECT C.CATEGORIA_LIQ, SUM(NVL(SM.SALDO_MXN, SM.SALDO)) AS TOTAL_MXN
+        SELECT C.CATEGORIA_LIQ, SUM(COALESCE(SM.SALDO_MXN, SM.SALDO)) AS TOTAL_MXN
         FROM SALDOS_MES SM
         JOIN CUENTAS C ON C.ID = SM.CUENTA_ID
-        WHERE SM.USUARIO_ID=:uid_val AND SM.ANIO=:anio_val AND SM.MES=:mes_val
+        WHERE SM.USUARIO_ID=%(uid_val)s AND SM.ANIO=%(anio_val)s AND SM.MES=%(mes_val)s
           AND C.CATEGORIA_LIQ IS NOT NULL
         GROUP BY C.CATEGORIA_LIQ
-    """, uid_val=uid, anio_val=anio, mes_val=mes)
+    """, {'uid_val': uid, 'anio_val': anio, 'mes_val': mes})
     por_cat = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
     patrimonio_bruto = sum(por_cat.values())
 
@@ -1306,10 +1294,10 @@ def patrimonio_resumen(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     mes_ant = mes - 1 if mes > 1 else 12
     anio_ant = anio if mes > 1 else anio - 1
     cur.execute("""
-        SELECT NVL(SUM(NVL(SM.SALDO_MXN, SM.SALDO)), 0)
+        SELECT COALESCE(SUM(COALESCE(SM.SALDO_MXN, SM.SALDO)), 0)
         FROM SALDOS_MES SM
-        WHERE SM.USUARIO_ID=:uid_val AND SM.ANIO=:anio_val AND SM.MES=:mes_val
-    """, uid_val=uid, anio_val=anio_ant, mes_val=mes_ant)
+        WHERE SM.USUARIO_ID=%(uid_val)s AND SM.ANIO=%(anio_val)s AND SM.MES=%(mes_val)s
+    """, {'uid_val': uid, 'anio_val': anio_ant, 'mes_val': mes_ant})
     row = cur.fetchone()
     total_anterior = float(row[0]) if row else 0
     variacion_pct = None
@@ -1318,10 +1306,10 @@ def patrimonio_resumen(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
 
     # Préstamos otorgados pendientes
     cur.execute("""
-        SELECT NVL(SUM(CAPITAL_ORIGINAL - CAPITAL_RECUPERADO), 0)
+        SELECT COALESCE(SUM(CAPITAL_ORIGINAL - CAPITAL_RECUPERADO), 0)
         FROM PRESTATARIOS
-        WHERE USUARIO_ID=:uid_val AND ESTATUS='Activo'
-    """, uid_val=uid)
+        WHERE USUARIO_ID=%(uid_val)s AND ESTATUS='Activo'
+    """, {'uid_val': uid})
     row = cur.fetchone()
     prestamos_otorgados = float(row[0]) if row else 0
 
@@ -1339,15 +1327,15 @@ def patrimonio_resumen(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
 def patrimonio_evolucion(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     cur = conn.cursor()
     cur.execute("""
-        SELECT TO_CHAR(SM.ANIO) || '-' ||
-               LPAD(TO_CHAR(SM.MES), 2, '0') AS PERIODO,
+        SELECT SM.ANIO::text || '-' ||
+               LPAD(SM.MES::text, 2, '0') AS PERIODO,
                C.CATEGORIA_LIQ,
-               SUM(NVL(SM.SALDO_MXN, SM.SALDO)) AS TOTAL_MXN
+               SUM(COALESCE(SM.SALDO_MXN, SM.SALDO)) AS TOTAL_MXN
         FROM SALDOS_MES SM
         JOIN CUENTAS C ON C.ID = SM.CUENTA_ID
-        WHERE SM.USUARIO_ID=:uid_val AND C.CATEGORIA_LIQ IS NOT NULL
+        WHERE SM.USUARIO_ID=%(uid_val)s AND C.CATEGORIA_LIQ IS NOT NULL
         GROUP BY SM.ANIO, SM.MES, C.CATEGORIA_LIQ
         ORDER BY SM.ANIO, SM.MES, C.CATEGORIA_LIQ
-    """, uid_val=uid)
+    """, {'uid_val': uid})
     return [{"periodo": r[0], "categoria_liq": r[1], "total_mxn": float(r[2] or 0)}
             for r in cur.fetchall()]
