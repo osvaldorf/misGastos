@@ -689,6 +689,35 @@ def get_ingresos(
     """, params)
     return rows_to_dict(cur)
 
+@app.get("/api/ingresos/resumen")
+def resumen_ingresos(
+    fecha_ini : Optional[date] = None,
+    fecha_fin : Optional[date] = None,
+    tipo      : Optional[str]  = None,
+    fuente_id : Optional[int]  = None,
+    cuenta_id : Optional[int]  = None,
+    uid=Depends(get_usuario_id), conn=Depends(get_conn)
+):
+    where  = ["I.USUARIO_ID=%(uid_val)s"]
+    params = {"uid_val": uid}
+    if fecha_ini: where.append("I.FECHA>=%(fi_val)s"); params["fi_val"]   = fecha_ini
+    if fecha_fin: where.append("I.FECHA<=%(ff_val)s"); params["ff_val"]   = fecha_fin
+    if tipo:      where.append("I.TIPO=%(tipo_val)s");      params["tipo_val"]  = tipo
+    if fuente_id: where.append("I.FUENTE_ID=%(fid_val)s"); params["fid_val"]   = fuente_id
+    if cuenta_id: where.append("I.CUENTA_ID=%(cid_val)s"); params["cid_val"]   = cuenta_id
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT COALESCE(COUNT(*),0) AS TOTAL_REGISTROS,
+               COALESCE(SUM(COALESCE(I.MONTO_MXN,I.MONTO)),0) AS TOTAL_MXN
+        FROM INGRESOS I
+        WHERE {' AND '.join(where)}
+    """, params)
+    row = cur.fetchone()
+    return {
+        "total_registros": int(row[0]),
+        "total_mxn": float(row[1])
+    }
+
 @app.post("/api/ingresos", status_code=201)
 async def create_ingreso(body: IngresoIn, uid=Depends(get_usuario_id), conn=Depends(get_conn)):
     # Validar desglose de préstamo
