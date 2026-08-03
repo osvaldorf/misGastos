@@ -32,7 +32,17 @@ if [ "$DEPLOY_FRONTEND" = true ]; then
 fi
 
 if [ "$DEPLOY_BACKEND" = true ]; then
-    echo "\n▶ [3] Subiendo backend..."
+    echo "\n▶ [3a] Subiendo requirements.txt..."
+    scp -i $SSH_KEY ~/GitHub/misGastos/requirements.txt $SERVER:$REMOTE_DIR/
+
+    echo "\n▶ [3b] Instalando dependencias en el venv remoto..."
+    ssh -i $SSH_KEY $SERVER "$REMOTE_DIR/venv/bin/pip install -q -r $REMOTE_DIR/requirements.txt"
+    echo "  ✅ Dependencias instaladas"
+
+    echo "\n▶ [3c] Respaldando main.py actual por si hay que revertir..."
+    ssh -i $SSH_KEY $SERVER "cp $REMOTE_DIR/main.py $REMOTE_DIR/main.py.bak"
+
+    echo "\n▶ [3d] Subiendo backend..."
     scp -i $SSH_KEY $BACKEND_FILE $SERVER:$REMOTE_DIR/
     echo "  ✅ Backend subido"
 fi
