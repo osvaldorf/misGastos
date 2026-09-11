@@ -896,6 +896,152 @@ def posicion_moneda(uid=Depends(get_usuario_id), conn=Depends(get_conn)):
         ) AS t GROUP BY MONEDA ORDER BY POSICION_NETA DESC
     """, {'uid_val': uid})
     return rows_to_dict(cur)
+
+# ════════════════════════════════════════
+#  REPORTES
+# ════════════════════════════════════════
+GASTO_DIM = {
+    "categoria": dict(
+        select="C.ID AS ID, C.NOMBRE AS CLAVE, C.EMOJI AS EMOJI, C.COLOR AS COLOR",
+        group="C.ID, C.NOMBRE, C.EMOJI, C.COLOR",
+        join="JOIN CATEGORIAS C ON C.ID=G.CATEGORIA_ID"),
+    "destinatario": dict(
+        select="D.ID AS ID, COALESCE(D.NOMBRE,'Sin destinatario') AS CLAVE, D.EMOJI AS EMOJI, D.COLOR AS COLOR",
+        group="D.ID, D.NOMBRE, D.EMOJI, D.COLOR",
+        join="LEFT JOIN DESTINATARIOS D ON D.ID=G.DESTINATARIO_ID"),
+    "cuenta": dict(
+        select="CTA.ID AS ID, CTA.NOMBRE AS CLAVE, NULL AS EMOJI, CTA.COLOR AS COLOR",
+        group="CTA.ID, CTA.NOMBRE, CTA.COLOR",
+        join="JOIN CUENTAS CTA ON CTA.ID=G.CUENTA_ID"),
+    "mes": dict(
+        select="TO_CHAR(G.FECHA,'YYYY-MM') AS ID, TO_CHAR(G.FECHA,'YYYY-MM') AS CLAVE, NULL AS EMOJI, NULL AS COLOR",
+        group="TO_CHAR(G.FECHA,'YYYY-MM')",
+        join=""),
+}
+
+INGRESO_DIM = {
+    "fuente": dict(
+        select="F.ID AS ID, F.NOMBRE AS CLAVE, NULL AS EMOJI, F.COLOR AS COLOR",
+        group="F.ID, F.NOMBRE, F.COLOR",
+        join="JOIN FUENTES_INGRESO F ON F.ID=I.FUENTE_ID"),
+    "tipo": dict(
+        select="I.TIPO AS ID, I.TIPO AS CLAVE, NULL AS EMOJI, NULL AS COLOR",
+        group="I.TIPO",
+        join=""),
+    "cuenta": dict(
+        select="CTA.ID AS ID, CTA.NOMBRE AS CLAVE, NULL AS EMOJI, CTA.COLOR AS COLOR",
+        group="CTA.ID, CTA.NOMBRE, CTA.COLOR",
+        join="JOIN CUENTAS CTA ON CTA.ID=I.CUENTA_ID"),
+    "mes": dict(
+        select="TO_CHAR(I.FECHA,'YYYY-MM') AS ID, TO_CHAR(I.FECHA,'YYYY-MM') AS CLAVE, NULL AS EMOJI, NULL AS COLOR",
+        group="TO_CHAR(I.FECHA,'YYYY-MM')",
+        join=""),
+}
+
+def _reportes_config(tipo: str):
+    if tipo == "gasto":
+        return "GASTOS", "G", GASTO_DIM
+    if tipo == "ingreso":
+        return "INGRESOS", "I", INGRESO_DIM
+    raise HTTPException(status_code=400, detail="tipo debe ser 'gasto' o 'ingreso'")
+
+def _reportes_where(alias: str, uid: int, fecha_ini, fecha_fin, categoria_id, dest_id, cuenta_id, fuente_id, tipo_ingreso):
+    where  = [f"{alias}.USUARIO_ID=%(uid_val)s"]
+    params = {"uid_val": uid}
+    if fecha_ini:    where.append(f"{alias}.FECHA>=%(fi_val)s");  params["fi_val"]  = fecha_ini
+    if fecha_fin:    where.append(f"{alias}.FECHA<=%(ff_val)s");  params["ff_val"]  = fecha_fin
+    if cuenta_id:    where.append(f"{alias}.CUENTA_ID=%(cta_val)s"); params["cta_val"] = cuenta_id
+    if categoria_id: where.append(f"{alias}.CATEGORIA_ID=%(cat_val)s"); params["cat_val"] = categoria_id
+    if dest_id:      where.append(f"{alias}.DESTINATARIO_ID=%(dest_val)s"); params["dest_val"] = dest_id
+    if fuente_id:    where.append(f"{alias}.FUENTE_ID=%(fuente_val)s"); params["fuente_val"] = fuente_id
+    if tipo_ingreso: where.append(f"{alias}.TIPO=%(tipo_val)s"); params["tipo_val"] = tipo_ingreso
+    return where, params
+
+@app.get("/api/reportes/rollup")
+def reportes_rollup(
+    tipo         : str,
+    agrupar_por  : str,
+    fecha_ini    : Optional[date] = None,
+    fecha_fin    : Optional[date] = None,
+    categoria_id : Optional[int]  = None,
+    dest_id      : Optional[int]  = None,
+    cuenta_id    : Optional[int]  = None,
+    fuente_id    : Optional[int]  = None,
+    tipo_ingreso : Optional[str]  = None,
+    uid=Depends(get_usuario_id), conn=Depends(get_conn)
+):
+    tabla, alias, dims = _reportes_config(tipo)
+    dim = dims.get(agrupar_por)
+    if not dim:
+        raise HTTPException(status_code=400, detail=f"agrupar_por inválido para tipo={tipo}. Opciones: {list(dims)}")
+    where, params = _reportes_where(alias, uid, fecha_ini, fecha_fin, categoria_id, dest_id, cuenta_id, fuente_id, tipo_ingreso)
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT {dim['select']},
+               SUM(COALESCE({alias}.MONTO_MXN,{alias}.MONTO)) AS TOTAL_MXN,
+               COUNT(*) AS REGISTROS
+        FROM {tabla} {alias} {dim['join']}
+        WHERE {' AND '.join(where)}
+        GROUP BY {dim['group']}
+        ORDER BY TOTAL_MXN DESC
+    """, params)
+    return rows_to_dict(cur)
+
+@app.get("/api/reportes/comparar")
+def reportes_comparar(
+    tipo           : str,
+    agrupar_por    : str,
+    periodo_a_ini  : date,
+    periodo_a_fin  : date,
+    periodo_b_ini  : date,
+    periodo_b_fin  : date,
+    categoria_id   : Optional[int] = None,
+    dest_id        : Optional[int] = None,
+    cuenta_id      : Optional[int] = None,
+    fuente_id      : Optional[int] = None,
+    tipo_ingreso   : Optional[str] = None,
+    uid=Depends(get_usuario_id), conn=Depends(get_conn)
+):
+    tabla, alias, dims = _reportes_config(tipo)
+    dim = dims.get(agrupar_por)
+    if not dim:
+        raise HTTPException(status_code=400, detail=f"agrupar_por inválido para tipo={tipo}. Opciones: {list(dims)}")
+
+    where_a, params_a = _reportes_where(alias, uid, periodo_a_ini, periodo_a_fin, categoria_id, dest_id, cuenta_id, fuente_id, tipo_ingreso)
+    where_b, params_b = _reportes_where(alias, uid, periodo_b_ini, periodo_b_fin, categoria_id, dest_id, cuenta_id, fuente_id, tipo_ingreso)
+    params_a = {f"a_{k}": v for k, v in params_a.items()}
+    params_b = {f"b_{k}": v for k, v in params_b.items()}
+    where_a = [w.replace("%(", "%(a_") for w in where_a]
+    where_b = [w.replace("%(", "%(b_") for w in where_b]
+
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT COALESCE(A.ID, B.ID) AS ID,
+               COALESCE(A.CLAVE, B.CLAVE) AS CLAVE,
+               COALESCE(A.EMOJI, B.EMOJI) AS EMOJI,
+               COALESCE(A.COLOR, B.COLOR) AS COLOR,
+               COALESCE(A.TOTAL_MXN, 0) AS TOTAL_A,
+               COALESCE(B.TOTAL_MXN, 0) AS TOTAL_B,
+               COALESCE(B.TOTAL_MXN, 0) - COALESCE(A.TOTAL_MXN, 0) AS VARIACION_ABS
+        FROM (
+            SELECT {dim['select']}, SUM(COALESCE({alias}.MONTO_MXN,{alias}.MONTO)) AS TOTAL_MXN
+            FROM {tabla} {alias} {dim['join']}
+            WHERE {' AND '.join(where_a)}
+            GROUP BY {dim['group']}
+        ) A
+        FULL OUTER JOIN (
+            SELECT {dim['select']}, SUM(COALESCE({alias}.MONTO_MXN,{alias}.MONTO)) AS TOTAL_MXN
+            FROM {tabla} {alias} {dim['join']}
+            WHERE {' AND '.join(where_b)}
+            GROUP BY {dim['group']}
+        ) B ON A.ID = B.ID
+        ORDER BY ABS(COALESCE(B.TOTAL_MXN, 0) - COALESCE(A.TOTAL_MXN, 0)) DESC
+    """, {**params_a, **params_b})
+    rows = rows_to_dict(cur)
+    for r in rows:
+        r["variacion_pct"] = round((r["variacion_abs"] / r["total_a"]) * 100, 1) if r["total_a"] else None
+    return rows
+
 # ════════════════════════════════════════
 #  AUTH — CAMBIAR PASSWORD
 # ════════════════════════════════════════

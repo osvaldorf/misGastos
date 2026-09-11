@@ -10,6 +10,7 @@ const NAV = [
   { to: '/prestamos',  icon: '🤝', label: 'Préstamos'  },
   { to: '/tarjetas',   icon: '💳', label: 'Tarjetas'   },
   { to: '/patrimonio', icon: '💎', label: 'Patrimonio' },
+  { to: '/reportes',   icon: '📈', label: 'Reportes'   },
   { to: '/config',     icon: '⚙️', label: 'Config'     },
 ]
 
