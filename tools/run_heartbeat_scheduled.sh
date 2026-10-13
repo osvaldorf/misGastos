@@ -26,6 +26,19 @@ notificar() {
     osascript -e "display notification \"$1\" with title \"Mis Finanzas — Heartbeat Oracle\"" >/dev/null 2>&1 || true
 }
 
+# `docker info` puede quedarse colgado mientras el motor arranca, así que
+# se corta a los 10s (macOS no trae `timeout`).
+docker_listo() {
+    docker info >/dev/null 2>&1 &
+    local pid=$!
+    for _ in $(seq 1 10); do
+        kill -0 $pid 2>/dev/null || { wait $pid; return $?; }
+        sleep 1
+    done
+    kill $pid 2>/dev/null
+    return 1
+}
+
 correr_heartbeat() {
     docker run --rm --env-file .env \
         -v "$REPO_DIR/wallet:/app/wallet:ro" -e TNS_ADMIN=/app/wallet \
@@ -37,21 +50,24 @@ correr_heartbeat() {
     echo "===== $TS ====="
 
     DOCKER_ABIERTO_POR_NOSOTROS=0
-    if ! docker info >/dev/null 2>&1; then
-        echo "Docker no está corriendo — abriendo Docker Desktop..."
-        open -g -a Docker
+    if ! docker_listo; then
+        # Docker Desktop a medio cerrar (o colgado) no arranca bien si se
+        # abre encima; se fuerza el apagado antes de iniciarlo de nuevo.
+        if pgrep -q -f com.docker.backend; then
+            echo "Docker Desktop no responde — forzando su cierre..."
+            docker desktop stop --force --timeout 120 >/dev/null 2>&1
+        fi
+        echo "Docker no está corriendo — iniciando Docker Desktop..."
         DOCKER_ABIERTO_POR_NOSOTROS=1
-        ESPERA=0
-        until docker info >/dev/null 2>&1; do
-            if [ $ESPERA -ge $DOCKER_TIMEOUT ]; then
-                echo "❌ Docker no arrancó en ${DOCKER_TIMEOUT}s — se omite esta corrida."
-                notificar "Docker no arrancó; Oracle no recibió heartbeat — revisa $LOG_FILE"
-                exit 1
-            fi
-            sleep 5
-            ESPERA=$((ESPERA + 5))
-        done
-        echo "Docker listo tras ${ESPERA}s."
+        INICIO=$SECONDS
+        docker desktop start --timeout $DOCKER_TIMEOUT >/dev/null 2>&1
+        if ! docker_listo; then
+            echo "❌ Docker no arrancó en ${DOCKER_TIMEOUT}s — se omite esta corrida."
+            notificar "Docker no arrancó; Oracle no recibió heartbeat — revisa $LOG_FILE"
+            docker desktop stop --force --timeout 120 >/dev/null 2>&1
+            exit 1
+        fi
+        echo "Docker listo tras $((SECONDS - INICIO))s."
     fi
 
     docker image inspect misgastos-sync >/dev/null 2>&1 \
@@ -73,7 +89,7 @@ correr_heartbeat() {
 
     if [ $DOCKER_ABIERTO_POR_NOSOTROS -eq 1 ]; then
         echo "Cerrando Docker Desktop (lo abrió este script)."
-        osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
+        docker desktop stop --timeout 120 >/dev/null 2>&1 || true
     fi
 
     exit $EXIT_CODE
