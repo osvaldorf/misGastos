@@ -12,6 +12,7 @@ import Tarjetas from './pages/Tarjetas'
 import Config from './pages/Config'
 import Admin from './pages/Admin'
 import Patrimonio from './pages/Patrimonio'
+import Reportes from './pages/Reportes'
 import client from './api/client'
 
 function PrivateRoute({ children }) {
@@ -48,6 +49,7 @@ function AppRoutes() {
       <Route path="/prestamos"  element={<PrivateRoute><Prestamos /></PrivateRoute>} />
       <Route path="/tarjetas"   element={<PrivateRoute><Tarjetas /></PrivateRoute>} />
       <Route path="/patrimonio" element={<PrivateRoute><Patrimonio /></PrivateRoute>} />
+      <Route path="/reportes"   element={<PrivateRoute><Reportes /></PrivateRoute>} />
       <Route path="/config"     element={<PrivateRoute><Config /></PrivateRoute>} />
       <Route path="/admin"      element={<PrivateRoute><Admin /></PrivateRoute>} />
       <Route path="*"           element={<Navigate to="/" replace />} />

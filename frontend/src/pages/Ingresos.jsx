@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { getIngresos, createIngreso, deleteIngreso } from '../api/ingresos'
+import { getIngresos, getIngresosResumen, createIngreso, deleteIngreso } from '../api/ingresos'
 import { getCuentas, getFuentes, getFuentesPrestamo } from '../api/catalogos'
 import { card, inputStyle, labelStyle, btnPrimary, btnSecondary, btnDanger, Modal, ErrorBox, fmtMoney, currentMonthRange, today } from '../components/ui'
 
@@ -8,6 +8,7 @@ const emptyForm = { descripcion: '', tipo: 'Salario', fuente_id: '', monto: '', 
 
 export default function Ingresos() {
   const [ingresos, setIngresos] = useState([])
+  const [resumen, setResumen] = useState(null)
   const [cuentas, setCuentas] = useState([])
   const [fuentes, setFuentes] = useState([])
   const [prestatarios, setPrestatarios] = useState([])
@@ -26,6 +27,7 @@ export default function Ingresos() {
     if (filtros.fecha_ini) params.fecha_ini = filtros.fecha_ini
     if (filtros.fecha_fin) params.fecha_fin = filtros.fecha_fin
     getIngresos(params).then(r => setIngresos(r.data)).catch(() => {})
+    getIngresosResumen(params).then(r => setResumen(r.data)).catch(() => {})
   }, [filtros])
 
   useEffect(() => { cargar() }, [cargar])
@@ -122,6 +124,13 @@ export default function Ingresos() {
         <input type="date" style={{ ...inputStyle, width: 'auto' }} value={filtros.fecha_ini} onChange={e => setFiltros(f => ({ ...f, fecha_ini: e.target.value }))} />
         <input type="date" style={{ ...inputStyle, width: 'auto' }} value={filtros.fecha_fin} onChange={e => setFiltros(f => ({ ...f, fecha_fin: e.target.value }))} />
       </div>
+
+      {resumen && (
+        <div style={{ marginBottom: 12, fontSize: 14, color: '#374151' }}>
+          <b>{resumen.total_registros}</b> ingresos &nbsp; Total filtrado: <b style={{ color: '#1D9E75' }}>{fmtMoney(resumen.total_mxn)}</b> &nbsp;
+          <span style={{ color: '#9ca3af' }}>Mostrando {ingresos.length} registros</span>
+        </div>
+      )}
 
       <div style={card}>
         {ingresos.length === 0 ? (

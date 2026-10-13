@@ -1,0 +1,40 @@
+# ============================================================
+#  Imagen para tools/sync_oracle_to_postgres.py
+#  Trae ambos drivers (Oracle + Postgres) — la imagen normal de
+#  la API (Dockerfile.api) ya no incluye el cliente de Oracle.
+#
+#  Build:  docker build -f tools/Dockerfile.sync -t misgastos-sync .
+#  Uso:    docker run --rm --network misgastos_default --env-file .env \
+#            -v "$(pwd)/wallet:/app/wallet:ro" -e TNS_ADMIN=/app/wallet \
+#            misgastos-sync
+#
+#  Para correrlo en bucle automático cada N segundos, agrega:
+#            -e SYNC_INTERVALO_SEGUNDOS=3600
+#          (y quita --rm para dejarlo corriendo en background con -d)
+# ============================================================
+FROM --platform=linux/arm64 python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    libaio1t64 \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/lib/aarch64-linux-gnu/libaio.so.1t64 /usr/lib/aarch64-linux-gnu/libaio.so.1
+
+RUN curl -fsSL -o /tmp/instantclient.zip \
+        https://download.oracle.com/otn_software/linux/instantclient/2326200/instantclient-basiclite-linux.arm64-23.26.2.0.0.zip \
+    && unzip -q /tmp/instantclient.zip -d /opt/oracle \
+    && rm /tmp/instantclient.zip \
+    && echo /opt/oracle/instantclient_23_26 > /etc/ld.so.conf.d/oracle-instantclient.conf \
+    && ldconfig
+
+ENV LD_LIBRARY_PATH=/opt/oracle/instantclient_23_26
+
+RUN pip install --no-cache-dir oracledb psycopg2-binary python-dotenv
+
+COPY tools/sync_oracle_to_postgres.py .
+
+CMD ["python3", "sync_oracle_to_postgres.py"]
